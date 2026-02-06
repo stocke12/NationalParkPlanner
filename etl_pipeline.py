@@ -53,7 +53,7 @@ def setup_database(engine):
     print("Database check complete.")
 
 def fetch_and_sync_parks(engine):
-    """Fetches all National Parks and syncs them to the database including images."""
+    """Fetches all National Parks and syncs them (skipping image_url to allow manual management)."""
     print("Syncing Parks...")
     endpoint = "https://developer.nps.gov/api/v1/parks?limit=1000"
     response = requests.get(endpoint, headers=HEADERS)
@@ -62,18 +62,12 @@ def fetch_and_sync_parks(engine):
     parksls = []
     for park in data['data']:
         designation = park['designation'].lower()
-        # Filtering for National Parks
         if "national park" in designation or "national and state park" in designation or park['name'] == "National Park of American Samoa":
-            
-            # Grab the first image URL if it exists
-            img_url = park['images'][0]['url'] if park['images'] else None
-            
             parksls.append({
                 'Park Name': park['name'],
                 'State': park['states'],
                 'Park Code': park['parkCode'],
-                'Id': park['id'],
-                'Image': img_url
+                'Id': park['id']
             })
 
     df = pd.DataFrame(parksls)
@@ -82,22 +76,20 @@ def fetch_and_sync_parks(engine):
     with engine.connect() as conn:
         for _, row in df.iterrows():
             try:
-                # Use ON CONFLICT to update if park already exists (including new image_url)
+                # Removed image_url from the DO UPDATE section to protect your manual work
                 query = text("""
-                    INSERT INTO parks (name, npid, state, code, image_url) 
-                    VALUES (:name, :npid, :state, :code, :image_url)
+                    INSERT INTO parks (name, npid, state, code) 
+                    VALUES (:name, :npid, :state, :code)
                     ON CONFLICT (npid) DO UPDATE SET
                         name = EXCLUDED.name,
                         state = EXCLUDED.state,
-                        code = EXCLUDED.code,
-                        image_url = EXCLUDED.image_url;
+                        code = EXCLUDED.code;
                 """)
                 conn.execute(query, {
                     "name": row['Park Name'],
                     "npid": row['Id'],
                     "state": row['State'],
-                    "code": row['Park Code'],
-                    "image_url": row['Image']
+                    "code": row['Park Code']
                 })
             except Exception as e:
                 print(f"Error inserting park {row['Park Name']}: {e}")
