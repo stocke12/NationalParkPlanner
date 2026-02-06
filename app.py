@@ -106,7 +106,7 @@ else:
             st.session_state.user_info = None
             st.rerun()
 
-    st.title("🌲 Park Assistant")
+    st.title("🌲 Park Planner 🐻")
     
     # Fetch Parks
     try:
