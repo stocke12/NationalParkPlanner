@@ -1,0 +1,29 @@
+name: Hourly Park Sync
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # Runs at the start of every hour
+  workflow_dispatch:      # Allows you to run it manually from GitHub
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests pandas sqlalchemy psycopg2-binary
+
+      - name: Run ETL
+        env:
+          # This pulls the connection string from GitHub Secrets
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NPS_API_KEY: ${{ secrets.NPS_API_KEY }}
+        run: python etl_pipeline.py
