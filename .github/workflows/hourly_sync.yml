@@ -19,11 +19,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests pandas sqlalchemy psycopg2-binary python-dotenv google-genai
+          pip install requests pandas sqlalchemy psycopg2-binary python-dotenv google-genai pytz
 
       - name: Run ETL
         env:
-          # This pulls the connection string from GitHub Secrets
+          # These pull the secrets you saved in GitHub Settings
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           NPS_API_KEY: ${{ secrets.NPS_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
