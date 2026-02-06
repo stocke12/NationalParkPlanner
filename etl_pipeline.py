@@ -1,10 +1,13 @@
 import requests
 import pandas as pd
-from datetime import datetime
+import os
+import pytz  # You may need to add this to your .yml pip install line
+from datetime import datetime, timedelta
 from sqlalchemy import text
 from database import get_connection
 
 # --- CONFIGURATION ---
+# Note: In a production environment, it's safer to pull this from os.getenv("NPS_API_KEY")
 NPS_API_KEY = "dZfBlMQvmHe03hV0Mt4O1EQqGZfEvIyr0EwQDaTh"
 HEADERS = {"X-Api-Key": NPS_API_KEY}
 
@@ -12,7 +15,7 @@ def setup_database(engine):
     """Ensures the tables exist before the ETL runs."""
     print("Initializing Database Tables...")
     with engine.connect() as conn:
-        # Create Parks Table with image_url column
+        # Create Parks Table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS parks (
                 id SERIAL PRIMARY KEY,
@@ -53,7 +56,7 @@ def setup_database(engine):
     print("Database check complete.")
 
 def fetch_and_sync_parks(engine):
-    """Fetches all National Parks and syncs them (skipping image_url to allow manual management)."""
+    """Fetches all National Parks and syncs them."""
     print("Syncing Parks...")
     endpoint = "https://developer.nps.gov/api/v1/parks?limit=1000"
     response = requests.get(endpoint, headers=HEADERS)
@@ -76,7 +79,6 @@ def fetch_and_sync_parks(engine):
     with engine.connect() as conn:
         for _, row in df.iterrows():
             try:
-                # Removed image_url from the DO UPDATE section to protect your manual work
                 query = text("""
                     INSERT INTO parks (name, npid, state, code) 
                     VALUES (:name, :npid, :state, :code)
@@ -130,7 +132,11 @@ def fetch_and_sync_alerts(engine):
         return
 
     df_alerts = pd.DataFrame(alerts_data)
-    now = datetime.now()
+    
+    # FIX 1: Set timezone to Mountain Standard Time (MST) so it matches your local clock
+    mountain_tz = pytz.timezone('America/Denver')
+    now = datetime.now(mountain_tz)
+    print(f"Current Sync Time (MST): {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
     with engine.connect() as conn:
         for _, row in df_alerts.iterrows():
@@ -157,13 +163,23 @@ def fetch_and_sync_alerts(engine):
             except Exception as e:
                 print(f"Error syncing alert {row['nps_id']}: {e}")
 
-        conn.execute(text("UPDATE alerts SET isactive = False WHERE lastseen < :now OR lastseen IS NULL"), {"now": now})
+        # FIX 2: Added a 10-minute buffer to prevent instant deactivation
+        buffer_time = now - timedelta(minutes=10)
+        conn.execute(text("""
+            UPDATE alerts 
+            SET isactive = False 
+            WHERE lastseen < :cutoff OR lastseen IS NULL
+        """), {"cutoff": buffer_time})
+        
         conn.commit()
     print(f"Successfully synced {len(df_alerts)} alerts.")
 
 if __name__ == "__main__":
     db_engine = get_connection()
     if db_engine:
+        # DEBUG: Verify the database name we are hitting
+        print(f"✅ Robot connected to: {str(db_engine.url).split('@')[-1]}") 
+        
         setup_database(db_engine)
         fetch_and_sync_parks(db_engine)
         fetch_and_sync_alerts(db_engine)
