@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import pandas as pd
 import time
+import traceback  # New: for capturing full error details
 from dotenv import load_dotenv
 from google import genai
 from sqlalchemy import text
@@ -20,6 +21,22 @@ if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "user_info" not in st.session_state:
     st.session_state.user_info = None
+
+# --- DATABASE HELPERS ---
+def log_error_to_db(username, error_msg, trace):
+    """Saves app errors to the database for debugging."""
+    try:
+        engine = get_connection()
+        with engine.connect() as conn:
+            query = text("""
+                INSERT INTO error_logs (username, error_message, stack_trace)
+                VALUES (:u, :e, :s)
+            """)
+            conn.execute(query, {"u": username, "e": error_msg, "s": trace})
+            conn.commit()
+    except Exception as db_e:
+        # Fallback to console if the database itself is failing
+        print(f"Failed to log error to DB: {db_e}")
 
 # --- PDF GENERATION HELPER ---
 def create_pdf(itinerary_text, park_name, user_name):
@@ -49,20 +66,19 @@ engine = get_connection()
 
 # --- LOGIN / REGISTRATION PAGE ---
 if not st.session_state.logged_in:
-    st.title("🌲 National Park Planner")
+    st.title("🌲 National Park Planner 🐻")
     st.subheader("Plan your adventure. But first, let's get to know you.")
     
     tab1, tab2 = st.tabs(["Login", "Create Account"])
     
     with tab1:
-        login_user = st.text_input("Username", key="login_user").strip()
+        login_user = st.text_input("Username", key="login_user").strip().lower()
         if st.button("Login"):
             if login_user:
                 with engine.connect() as conn:
                     query = text("SELECT * FROM users WHERE username = :u")
                     res = conn.execute(query, {"u": login_user}).fetchone()
                     if res:
-                        # Store user info (Mapping: 0:id, 1:username, 2:firstname, etc.)
                         st.session_state.user_info = res
                         st.session_state.logged_in = True
                         st.rerun()
@@ -72,7 +88,7 @@ if not st.session_state.logged_in:
                 st.warning("Please enter a username.")
 
     with tab2:
-        new_user = st.text_input("Choose a Username", key="new_user").strip()
+        new_user = st.text_input("Choose a Username", key="new_user").strip().lower()
         new_fname = st.text_input("First Name")
         new_lname = st.text_input("Last Name")
         new_email = st.text_input("Email")
@@ -92,15 +108,16 @@ if not st.session_state.logged_in:
                         conn.commit()
                         st.success("Account created! You can now log in.")
                 except Exception as e:
+                    error_trace = traceback.format_exc()
+                    log_error_to_db(new_user, str(e), error_trace)
                     st.error("Username already taken or database error.")
             else:
                 st.warning("Please fill in required fields (Username, First Name, Email).")
 
-# --- MAIN APP PAGE (Only visible if logged in) ---
+# --- MAIN APP PAGE ---
 else:
-    # Sidebar Logout
     with st.sidebar:
-        st.write(f"Logged in as: **{st.session_state.user_info[2]}**") # Assuming 2 is firstname
+        st.write(f"Logged in as: **{st.session_state.user_info[2]}**")
         if st.button("Log Out"):
             st.session_state.logged_in = False
             st.session_state.user_info = None
@@ -108,12 +125,13 @@ else:
 
     st.title("🌲 Park Planner 🐻")
     
-    # Fetch Parks
     try:
         with engine.connect() as conn:
             df_all_parks = pd.read_sql(text("SELECT name, code, id, image_url FROM parks ORDER BY name"), conn)
             park_list = df_all_parks['name'].tolist()
-    except:
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        log_error_to_db(st.session_state.user_info[1], str(e), error_trace)
         st.error("Database error fetching parks.")
         park_list = []
 
@@ -131,17 +149,14 @@ else:
         stay_nights = st.number_input("How many nights?", min_value=1, value=3)
 
         if st.button("Generate My Custom Itinerary"):
-            # Get specific park info
             selected_park_info = df_all_parks[df_all_parks['name'] == selected_park_name].iloc[0]
             park_id = int(selected_park_info['id'])
 
-            # Fetch Alerts
             with engine.connect() as conn:
                 alert_query = text("SELECT title, description FROM alerts WHERE park_id = :pid AND isactive = True")
                 df_alerts = pd.read_sql(alert_query, conn, params={"pid": park_id})
                 alerts_str = df_alerts.to_string(index=False) if not df_alerts.empty else "No active alerts."
 
-            # Prompt Logic
             prompt = f"""
             System: You are an expert National Park guide.
             User Profile: {st.session_state.user_info[2]} likes {st.session_state.user_info[5]}.
@@ -154,14 +169,13 @@ else:
             with st.spinner(f"Creating your adventure for {selected_park_name}..."):
                 try:
                     response = client.models.generate_content(
-                        model="gemini-2.0-flash", # Updated to the latest stable model
+                        model="gemini-2.0-flash",
                         contents=prompt
                     )
                     response_text = response.text
                     
                     st.divider()
                     
-                    # Manual Image Logic
                     if selected_park_info['image_url']:
                         st.image(selected_park_info['image_url'], use_container_width=True)
                     else:
@@ -170,7 +184,6 @@ else:
                     st.header(f"Your Itinerary for {selected_park_name}")
                     st.markdown(response_text)
                     
-                    # Download PDF
                     pdf_bytes = create_pdf(response_text, selected_park_name, st.session_state.user_info[2])
                     st.download_button(
                         label="📥 Download PDF Itinerary",
@@ -179,4 +192,9 @@ else:
                         mime="application/pdf"
                     )
                 except Exception as e:
+                    # Log the full error to your database
+                    error_trace = traceback.format_exc()
+                    username = st.session_state.user_info[1] if st.session_state.user_info else "Unknown"
+                    log_error_to_db(username, str(e), error_trace)
+                    
                     st.error("Uh oh... something went wrong! Please try again later!")
