@@ -1,23 +1,20 @@
-from sqlalchemy import create_engine
 import os
+from sqlalchemy import create_engine
 from dotenv import load_dotenv
 
 load_dotenv()
 
 def get_connection():
-    # 1. Try to get the full connection string (used by GitHub/Streamlit)
-    conn_str = os.getenv("DATABASE_URL")
+    # 1. Look for the one-and-only connection string
+    url = os.getenv("DATABASE_URL")
     
-    if conn_str:
-        # If it starts with postgres://, SQLAlchemy needs it to be postgresql://
-        if conn_str.startswith("postgres://"):
-            conn_str = conn_str.replace("postgres://", "postgresql://", 1)
-        return create_engine(conn_str)
-    
-    # 2. Fallback to individual variables (your local setup)
-    user = os.getenv("DB_USER")
-    pw = os.getenv("DB_PASSWORD")
-    db = os.getenv("DB_NAME")
-    host = os.getenv("DB_HOST")
-    
-    return create_engine(f'postgresql+psycopg2://{user}:{pw}@{host}:5432/{db}')
+    # 2. If it's not there, CRASH immediately so we know there's a problem
+    if not url:
+        print("❌ ERROR: DATABASE_URL environment variable is MISSING!")
+        return None
+
+    # 3. Handle the 'postgres://' vs 'postgresql://' fix for SQLAlchemy 2.0
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+        
+    return create_engine(url)
