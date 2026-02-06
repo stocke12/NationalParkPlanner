@@ -169,7 +169,7 @@ else:
             with st.spinner(f"Creating your adventure for {selected_park_name}..."):
                 try:
                     response = client.models.generate_content(
-                        model="gemini-2.0-flash",
+                        model="gemini-3-flash-preview",
                         contents=prompt
                     )
                     response_text = response.text
