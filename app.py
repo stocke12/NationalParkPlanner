@@ -179,4 +179,4 @@ else:
                         mime="application/pdf"
                     )
                 except Exception as e:
-                    print('Uh oh...something went wrong! Please try again later!')
+                    st.error(f"Uh oh... something went wrong! Error: {e}")
