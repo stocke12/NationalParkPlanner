@@ -183,6 +183,7 @@ else:
 
                     st.header(f"Your Itinerary for {selected_park_name}")
                     st.markdown(response_text)
+                    st.markdown(alerts_str)
                     
                     pdf_bytes = create_pdf(response_text, selected_park_name, st.session_state.user_info[2])
                     st.download_button(
