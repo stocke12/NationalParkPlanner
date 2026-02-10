@@ -2,7 +2,7 @@ import streamlit as st
 import os
 import pandas as pd
 import time
-import traceback  # New: for capturing full error details
+import traceback
 from dotenv import load_dotenv
 from google import genai
 from sqlalchemy import text
@@ -11,7 +11,13 @@ from fpdf import FPDF
 
 # 1. SETUP: Load environment and AI Client
 load_dotenv()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    st.error("Missing GEMINI_API_KEY. Please set it in your environment variables.")
+    st.stop()
+
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 # 2. CONFIG: Page styling
 st.set_page_config(page_title="National Park Planner", page_icon="🌲", layout="centered")
@@ -22,11 +28,16 @@ if "logged_in" not in st.session_state:
 if "user_info" not in st.session_state:
     st.session_state.user_info = None
 
+# --- DATABASE CONNECTION CHECK ---
+engine = get_connection()
+if engine is None:
+    st.error("❌ DATABASE_URL is missing or incorrect. Please check your .env or Streamlit Secrets.")
+    st.stop()
+
 # --- DATABASE HELPERS ---
 def log_error_to_db(username, error_msg, trace):
     """Saves app errors to the database for debugging."""
     try:
-        engine = get_connection()
         with engine.connect() as conn:
             query = text("""
                 INSERT INTO error_logs (username, error_message, stack_trace)
@@ -35,11 +46,10 @@ def log_error_to_db(username, error_msg, trace):
             conn.execute(query, {"u": username, "e": error_msg, "s": trace})
             conn.commit()
     except Exception as db_e:
-        # Fallback to console if the database itself is failing
         print(f"Failed to log error to DB: {db_e}")
 
 # --- PDF GENERATION HELPER ---
-def create_pdf(itinerary_text, park_name, user_name):
+def create_pdf(itinerary_text, park_name, user_name, alerts_list):
     replacements = {
         '’': "'", '‘': "'", '”': '"', '“': '"',
         '—': '-', '–': '-', '•': '*',
@@ -51,18 +61,28 @@ def create_pdf(itinerary_text, park_name, user_name):
     pdf = FPDF()
     pdf.add_page()
     
+    # Title
     pdf.set_font("Helvetica", 'B', 16)
     pdf.cell(0, 10, f"National Park Adventure: {park_name}", ln=True, align='C')
     pdf.set_font("Helvetica", 'I', 12)
     pdf.cell(0, 10, f"Customized for {user_name}", ln=True, align='C')
     pdf.ln(10)
     
+    # Itinerary Content
     pdf.set_font("Helvetica", size=11)
     pdf.multi_cell(0, 7, itinerary_text)
-    return bytes(pdf.output())
+    
+    # Add Alerts to PDF if they exist
+    if alerts_list:
+        pdf.ln(10)
+        pdf.set_font("Helvetica", 'B', 14)
+        pdf.cell(0, 10, "Current Safety Alerts:", ln=True)
+        pdf.set_font("Helvetica", size=10)
+        for alert in alerts_list:
+            pdf.multi_cell(0, 7, f"- {alert['title']}: {alert['description']}")
+            pdf.ln(2)
 
-# --- DATABASE CONNECTION ---
-engine = get_connection()
+    return bytes(pdf.output())
 
 # --- LOGIN / REGISTRATION PAGE ---
 if not st.session_state.logged_in:
@@ -75,15 +95,18 @@ if not st.session_state.logged_in:
         login_user = st.text_input("Username", key="login_user").strip().lower()
         if st.button("Login"):
             if login_user:
-                with engine.connect() as conn:
-                    query = text("SELECT * FROM users WHERE username = :u")
-                    res = conn.execute(query, {"u": login_user}).fetchone()
-                    if res:
-                        st.session_state.user_info = res
-                        st.session_state.logged_in = True
-                        st.rerun()
-                    else:
-                        st.error("User not found. Please create an account.")
+                try:
+                    with engine.connect() as conn:
+                        query = text("SELECT * FROM users WHERE username = :u")
+                        res = conn.execute(query, {"u": login_user}).fetchone()
+                        if res:
+                            st.session_state.user_info = res
+                            st.session_state.logged_in = True
+                            st.rerun()
+                        else:
+                            st.error("User not found. Please create an account.")
+                except Exception as e:
+                    st.error(f"Login error: {e}")
             else:
                 st.warning("Please enter a username.")
 
@@ -136,7 +159,7 @@ else:
         park_list = []
 
     if not park_list:
-        st.warning("No parks found in database.")
+        st.warning("No parks found in database. Run the ETL script to sync data.")
     else:
         st.header(f"Welcome back, {st.session_state.user_info[2]}!")
         
@@ -152,21 +175,24 @@ else:
             selected_park_info = df_all_parks[df_all_parks['name'] == selected_park_name].iloc[0]
             park_id = int(selected_park_info['id'])
 
+            # Fetch active alerts for the selected park
             with engine.connect() as conn:
                 alert_query = text("SELECT title, description FROM alerts WHERE park_id = :pid AND isactive = True")
-                df_alerts = pd.read_sql(alert_query, conn, params={"pid": park_id})
-                alerts_str = df_alerts.to_string(index=False) if not df_alerts.empty else "No active alerts."
+                res = conn.execute(alert_query, {"pid": park_id}).fetchall()
+                active_alerts = [{"title": row[0], "description": row[1]} for row in res]
+
+            alerts_text_for_ai = "\n".join([f"- {a['title']}: {a['description']}" for a in active_alerts]) if active_alerts else "No active alerts."
 
             prompt = f"""
             System: You are an expert National Park guide.
             User Profile: {st.session_state.user_info[2]} likes {st.session_state.user_info[5]}.
             Trip: {selected_park_name} for {stay_nights} nights in {visit_dates}.
-            Safety/Alerts: {alerts_str}
+            Current Safety/Alerts: {alerts_text_for_ai}
             
-            Task: Provide a detailed day-by-day itinerary tailored to the user's travel style.
+            Task: Provide a detailed day-by-day itinerary tailored to the user's travel style. Mention specific alerts if they impact the activities.
             """
 
-            with st.spinner(f"Creating your adventure for {selected_park_name}..."):
+            with st.spinner(f"Consulting our Park Ranger AI for {selected_park_name}..."):
                 try:
                     response = client.models.generate_content(
                         model="gemini-3-flash-preview",
@@ -176,16 +202,25 @@ else:
                     
                     st.divider()
                     
+                    # Display Park Image
                     if selected_park_info['image_url']:
                         st.image(selected_park_info['image_url'], use_container_width=True)
-                    else:
-                        st.info("📷 Beautiful imagery for this park is being curated!")
 
                     st.header(f"Your Itinerary for {selected_park_name}")
                     st.markdown(response_text)
-                    st.markdown(alerts_str)
                     
-                    pdf_bytes = create_pdf(response_text, selected_park_name, st.session_state.user_info[2])
+                    # --- ALERT SECTION AT THE END ---
+                    st.divider()
+                    if active_alerts:
+                        with st.expander(f"⚠️ Important Safety Alerts for {selected_park_name}", expanded=True):
+                            for alert in active_alerts:
+                                st.subheader(alert['title'])
+                                st.write(alert['description'])
+                    else:
+                        st.success("✅ No active alerts reported for this park! Enjoy your trip.")
+
+                    # Generate and allow PDF Download
+                    pdf_bytes = create_pdf(response_text, selected_park_name, st.session_state.user_info[2], active_alerts)
                     st.download_button(
                         label="📥 Download PDF Itinerary",
                         data=pdf_bytes,
@@ -193,9 +228,7 @@ else:
                         mime="application/pdf"
                     )
                 except Exception as e:
-                    # Log the full error to your database
                     error_trace = traceback.format_exc()
                     username = st.session_state.user_info[1] if st.session_state.user_info else "Unknown"
                     log_error_to_db(username, str(e), error_trace)
-                    
-                    st.error("Uh oh... something went wrong! Please try again later!")
+                    st.error("Uh oh... Gemini is taking a hike. Please try again in a moment!")
