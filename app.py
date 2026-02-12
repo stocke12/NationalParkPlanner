@@ -23,10 +23,15 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # 2. CONFIG
 st.set_page_config(page_title="National Park Planner", page_icon="🌲", layout="centered")
 
+# Initialize session states
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "user_info" not in st.session_state:
     st.session_state.user_info = None
+if "curated_itinerary" not in st.session_state:
+    st.session_state.curated_itinerary = []
+if "temp_suggestions" not in st.session_state:
+    st.session_state.temp_suggestions = []
 
 engine = get_connection()
 if engine is None:
@@ -102,6 +107,7 @@ else:
         st.write(f"User: **{st.session_state.user_info[2]}**")
         if st.button("Log Out"):
             st.session_state.logged_in = False
+            st.session_state.curated_itinerary = []
             st.rerun()
 
     plan_tab, friend_tab, my_trips_tab = st.tabs(["🗺️ Plan Trip", "👥 Friends", "🎒 My Trips"])
@@ -156,7 +162,6 @@ else:
         else:
             p_sel = st.selectbox("Select Park", options=park_names)
             
-            # --- UPDATED DATE PICKER ---
             st.write("Select Trip Dates:")
             date_range = st.date_input(
                 "Pick a start and end date",
@@ -165,21 +170,15 @@ else:
                 format="MM/DD/YYYY"
             )
             
-            # Extract start and end from range
             start_dt = date_range[0] if len(date_range) > 0 else date.today()
             end_dt = date_range[1] if len(date_range) > 1 else start_dt
             nights_calc = (end_dt - start_dt).days
             
-            if nights_calc < 1:
-                st.caption("Please select a range of at least one night.")
-            else:
-                st.caption(f"Trip Duration: {nights_calc} nights")
-            
             invited = st.multiselect("Invite Friends?", options=accepted_friend_names)
 
-            if st.button("Generate & Save Trip"):
+            if st.button("Generate Suggestions"):
                 if len(date_range) < 2:
-                    st.error("Please select both a start and end date on the calendar.")
+                    st.error("Please select a date range.")
                 else:
                     p_info = df_parks[df_parks['name'] == p_sel].iloc[0]
                     p_id = int(p_info['id'])
@@ -188,79 +187,71 @@ else:
                         al_res = conn.execute(text("SELECT title, description FROM alerts WHERE park_id = :p AND isactive=True"), {"p": p_id}).fetchall()
                         active_alerts = [{"title": r[0], "description": r[1]} for r in al_res]
 
-                    prompt = f"""
-                    You are Ranger Gemini. Plan a trip to {p_sel}.
-                    Dates: {start_dt} to {end_dt} ({nights_calc} nights).
-                    Style: {st.session_state.user_info[5]}.
-                    Alerts: {active_alerts}.
-                    Professional day-by-day itinerary.
-                    """
+                    prompt = f"Ranger Gemini: Plan a trip to {p_sel}. Dates: {start_dt} to {end_dt}. Style: {st.session_state.user_info[5]}. Alerts: {active_alerts}. Professional itinerary with distinct paragraphs for activities."
                     
-                    with st.spinner("Ranger Gemini is planning..."):
-                        resp_text = client.models.generate_content(model="gemini-3-flash-preview", contents=prompt).text
+                    with st.spinner("Thinking..."):
+                        resp = client.models.generate_content(model="gemini-3-flash-preview", contents=prompt)
+                        st.session_state.temp_suggestions = [s.strip() for s in resp.text.split('\n\n') if s.strip()]
+                        st.session_state.curated_itinerary = [] # Reset workspace for new park
+
+        # --- OPTION A: WORKSPACE ---
+        if st.session_state.temp_suggestions:
+            st.divider()
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                st.subheader("💡 Suggestions")
+                for i, sugg in enumerate(st.session_state.temp_suggestions):
+                    with st.container(border=True):
+                        st.write(sugg)
+                        if st.button("Add ➕", key=f"add_{i}"):
+                            st.session_state.curated_itinerary.append(sugg)
+                            st.rerun()
+
+            with col_b:
+                st.subheader("🎒 Your Plan")
+                for j, item in enumerate(st.session_state.curated_itinerary):
+                    with st.container(border=True):
+                        st.write(item)
+                        if st.button("Remove 🗑️", key=f"rem_{j}"):
+                            st.session_state.curated_itinerary.pop(j)
+                            st.rerun()
+                
+                if st.session_state.curated_itinerary:
+                    if st.button("💾 Save Final Trip"):
+                        final_itinerary = "\n\n".join(st.session_state.curated_itinerary)
+                        p_info = df_parks[df_parks['name'] == p_sel].iloc[0]
+                        p_id = int(p_info['id'])
                         
                         try:
                             with engine.connect() as conn:
-                                # 1. Create Trip (Saving real DATE objects now)
                                 tid_res = conn.execute(text("""
                                     INSERT INTO trips (user_id, owner_id, trip_name, status, start_date, end_date) 
                                     VALUES (:u, :o, :n, 'planned', :sd, :ed) RETURNING id
-                                """), {
-                                    "u": current_uid, 
-                                    "o": current_uid, 
-                                    "n": f"{p_sel} Adventure",
-                                    "sd": start_dt,
-                                    "ed": end_dt
-                                })
+                                """), {"u": current_uid, "o": current_uid, "n": f"{p_sel} Adventure", "sd": start_dt, "ed": end_dt})
                                 tid = tid_res.fetchone()[0]
 
-                                # 2. Participants
                                 conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t, :u, 'owner', 'accepted', :u)"), {"t": tid, "u": current_uid})
                                 for f_user in invited:
                                     fid = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_user}).fetchone()[0]
                                     conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t, :u, 'collaborator', 'pending', :by)"), {"t": tid, "u": fid, "by": current_uid})
                                 
-                                # 3. Save Park Link
-                                conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)"), {"t": tid, "p": p_id, "n": resp_text})
+                                conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)"), {"t": tid, "p": p_id, "n": final_itinerary})
                                 conn.commit()
-                                
-                            st.divider()
-                            if p_info['image_url']: 
-                                st.image(p_info['image_url'], use_container_width=True)
-                            
-                            st.header(f"Your Itinerary for {p_sel}")
-                            st.markdown(resp_text)
-                            
-                            st.divider()
-                            if active_alerts:
-                                with st.expander(f"⚠️ Important Safety Alerts", expanded=True):
-                                    for a in active_alerts:
-                                        st.subheader(a['title'])
-                                        st.write(a['description'])
-                                
-                            pdf_bytes = create_pdf(resp_text, p_sel, st.session_state.user_info[2], active_alerts)
-                            st.download_button("📥 Download PDF", pdf_bytes, f"{p_sel.replace(' ', '_')}.pdf", "application/pdf")
-                        
+                                st.success("Trip Saved! View it in 'My Trips'.")
                         except Exception as e:
-                            st.error(f"Save Failed: {e}")
+                            st.error(f"Error: {e}")
 
     # --- MY TRIPS ---
     with my_trips_tab:
         st.header("Your Saved Adventures")
         with engine.connect() as conn:
             my_trips = conn.execute(text("""
-                SELECT 
-                    t.trip_name, 
-                    t.status, 
-                    t.start_date, 
-                    t.end_date,
-                    tpk.notes AS itinerary  -- Pulling the saved AI text
+                SELECT t.trip_name, t.status, t.start_date, t.end_date, tpk.notes, t.id
                 FROM trips t
                 JOIN trip_participants tp ON t.id = tp.trip_id
-                LEFT JOIN trip_parks tpk ON t.id = tpk.trip_id  -- Join to get the notes
-                WHERE tp.user_id = :u 
-                ORDER BY t.start_date DESC
-            """), {"u": current_uid}).fetchall()
+                LEFT JOIN trip_parks tpk ON t.id = tpk.trip_id
+                WHERE tp.user_id = :u ORDER BY t.start_date DESC"""), {"u": current_uid}).fetchall()
             
             if not my_trips:
                 st.info("No trips yet!")
@@ -268,9 +259,9 @@ else:
                 date_str = f"{t[2]} to {t[3]}" if t[2] else "Dates not set"
                 with st.expander(f"📍 {t[0]} ({date_str})"):
                     st.write(f"**Status:** {t[1]}")
-                    st.divider()
-                    # Display the itinerary if it exists
+                    st.markdown(t[4] if t[4] else "No itinerary details.")
+                    
+                    # PDF Download for saved trips
                     if t[4]:
-                        st.markdown(t[4])
-                    else:
-                        st.info("No itinerary details found for this adventure.")
+                        pdf_b = create_pdf(t[4], t[0], st.session_state.user_info[2], [])
+                        st.download_button("📥 Download PDF", pdf_b, f"Trip_{t[5]}.pdf", "application/pdf", key=f"dl_{t[5]}")
