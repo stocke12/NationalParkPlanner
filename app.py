@@ -104,6 +104,9 @@ def render_dnd_itinerary(day_activities, days, editable=True):
             "activities": [{"id": a["id"], "name": a["name"], "type": a.get("type", "Activity")} for a in acts]
         })
 
+    delete_btn = '<button class="delete-btn" onclick="deleteActivity(this)" title="Remove">✕</button>' if editable else ""
+    draggable_attr = "draggable='true' ondragstart='handleDragStart(event, this)'" if editable else ""
+
     html = f"""
     <style>
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -187,13 +190,13 @@ def render_dnd_itinerary(day_activities, days, editable=True):
             <div class="day-header">{d["label"]}</div>
             {"".join(f'''
             <div class="activity-card" 
-                 {"draggable='true' ondragstart='handleDragStart(event, this)'" if editable else ""}
+                 {draggable_attr}
                  data-id="{a["id"]}" data-day="{d["day"]}">
                 <div>
                     <div class="act-name">{a["name"]}</div>
                     <div class="act-type">{a["type"]}</div>
                 </div>
-                {"f'<button class=\"delete-btn\" onclick=\"deleteActivity(this)\" title=\"Remove\">✕</button>' if editable else ""}
+                {delete_btn}
             </div>
             ''' for a in d["activities"])}
             <div class="drop-zone"></div>
