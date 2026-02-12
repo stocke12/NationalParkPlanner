@@ -249,9 +249,18 @@ else:
         st.header("Your Saved Adventures")
         with engine.connect() as conn:
             my_trips = conn.execute(text("""
-                SELECT t.trip_name, t.status, t.start_date, t.end_date FROM trips t
+                SELECT 
+                    t.trip_name, 
+                    t.status, 
+                    t.start_date, 
+                    t.end_date,
+                    tpk.notes AS itinerary  -- Pulling the saved AI text
+                FROM trips t
                 JOIN trip_participants tp ON t.id = tp.trip_id
-                WHERE tp.user_id = :u ORDER BY t.start_date DESC"""), {"u": current_uid}).fetchall()
+                LEFT JOIN trip_parks tpk ON t.id = tpk.trip_id  -- Join to get the notes
+                WHERE tp.user_id = :u 
+                ORDER BY t.start_date DESC
+            """), {"u": current_uid}).fetchall()
             
             if not my_trips:
                 st.info("No trips yet!")
@@ -259,3 +268,9 @@ else:
                 date_str = f"{t[2]} to {t[3]}" if t[2] else "Dates not set"
                 with st.expander(f"📍 {t[0]} ({date_str})"):
                     st.write(f"**Status:** {t[1]}")
+                    st.divider()
+                    # Display the itinerary if it exists
+                    if t[4]:
+                        st.markdown(t[4])
+                    else:
+                        st.info("No itinerary details found for this adventure.")
