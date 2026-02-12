@@ -428,9 +428,11 @@ else:
                         st.markdown("### ✏️ Edit Trip")
 
                         new_name = st.text_input("Trip Name", value=t.trip_name, key=f"name_{t.id}")
+                        start = t.start_date if isinstance(t.start_date, date) else date.fromisoformat(str(t.start_date))
+                        end = t.end_date if isinstance(t.end_date, date) else date.fromisoformat(str(t.end_date))
                         new_dates = st.date_input(
                             "Dates",
-                            value=(t.start_date, t.end_date),
+                            value=(start, end),
                             key=f"dates_{t.id}"
                         )
                         new_park = st.selectbox(
