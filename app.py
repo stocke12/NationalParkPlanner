@@ -176,25 +176,54 @@ else:
                 st.markdown(st.session_state.master_itinerary)
                 
                 if st.button("💾 Save Everything"):
-                    with engine.connect() as conn:
-                        tid = conn.execute(text("""
-                            INSERT INTO trips (user_id, owner_id, trip_name, start_date, end_date) 
-                            VALUES (:u, :u, :n, :s, :e) RETURNING id
-                        """), {"u": current_uid, "n": f"{p_sel} Trip", "s": date_range[0], "e": date_range[1]}).fetchone()[0]
-                        
-                        conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status) VALUES (:t, :u, 'owner', 'accepted')"), {"t": tid, "u": current_uid})
-                        
-                        # Use the KEY from the multiselect
-                        for f_name in st.session_state.invited_friends:
-                            fid_res = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_name}).fetchone()
-                            if fid_res:
-                                conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status) VALUES (:t, :u, 'guest', 'pending')"), {"t": tid, "u": fid_res[0]})
-                        
-                        p_id = int(df_parks[df_parks['name'] == p_sel]['id'].iloc[0])
-                        final_notes = f"MASTER ITINERARY:\n{st.session_state.master_itinerary}\n\nSAVED ACTIVITIES:\n" + "\n".join(st.session_state.curated_itinerary)
-                        conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)"), {"t": tid, "p": p_id, "n": final_notes})
-                        conn.commit()
+                    try:
+                        with engine.begin() as conn:  # .begin() automatically handles COMMIT/ROLLBACK
+                            # 1. Insert the Trip
+                            tid_res = conn.execute(text("""
+                                INSERT INTO trips (user_id, owner_id, trip_name, start_date, end_date) 
+                                VALUES (:u, :u, :n, :s, :e) RETURNING id
+                            """), {
+                                "u": current_uid, 
+                                "n": f"{p_sel} Trip", 
+                                "s": date_range[0], 
+                                "e": date_range[1]
+                            }).fetchone()
+                            
+                            tid = tid_res[0]
+                            
+                            # 2. Add Owner (You) - Use "ON CONFLICT DO NOTHING" if using Postgres
+                            # Or just rely on the fact that this is a brand new tid from the line above
+                            conn.execute(text("""
+                                INSERT INTO trip_participants (trip_id, user_id, role, invitation_status) 
+                                VALUES (:t, :u, 'owner', 'accepted')
+                            """), {"t": tid, "u": current_uid})
+                            
+                            # 3. Add Invited Friends
+                            if st.session_state.invited_friends:
+                                for f_name in st.session_state.invited_friends:
+                                    fid_res = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_name}).fetchone()
+                                    if fid_res:
+                                        conn.execute(text("""
+                                            INSERT INTO trip_participants (trip_id, user_id, role, invitation_status) 
+                                            VALUES (:t, :u, 'guest', 'pending')
+                                        """), {"t": tid, "u": fid_res[0]})
+                            
+                            # 4. Save Park Details & AI Itinerary
+                            p_id = int(df_parks[df_parks['name'] == p_sel]['id'].iloc[0])
+                            final_notes = f"MASTER ITINERARY:\n{st.session_state.master_itinerary}\n\nSAVED ACTIVITIES:\n" + "\n".join(st.session_state.curated_itinerary)
+                            
+                            conn.execute(text("""
+                                INSERT INTO trip_parks (trip_id, park_id, notes) 
+                                VALUES (:t, :p, :n)
+                            """), {"t": tid, "p": p_id, "n": final_notes})
+                            
                         st.success("Adventure locked in!")
+                        st.balloons()
+                        
+                    except Exception as e:
+                        st.error(f"Database Error: {e}")
+                        # This is where your SQL experience comes in handy for debugging:
+                        # Check if trip_participants has a unique constraint you're hitting.
 
     # --- MY TRIPS ---
     with my_trips_tab:
