@@ -115,28 +115,22 @@ else:
 
     plan_tab, friend_tab, my_trips_tab = st.tabs(["🗺️ Plan Trip", "👥 Friends", "🎒 My Trips"])
 
-    # --- FRIENDS TAB (WITH PENDING REQUESTS) ---
+    # --- FRIENDS TAB ---
     with friend_tab:
         st.header("Social Hub")
-        
-        # 1. Send Request
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            f_search = st.text_input("Add Friend by Username").strip().lower()
-        with col2:
-            if st.button("Send Request"):
-                with engine.connect() as conn:
-                    f_res = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_search}).fetchone()
-                    if f_res:
-                        try:
-                            conn.execute(text("INSERT INTO friendships (user_id, friend_id, status) VALUES (:u, :f, 'pending')"),
-                                         {"u": current_uid, "f": f_res[0]})
-                            conn.commit()
-                            st.success(f"Request sent to {f_search}!")
-                        except: st.warning("Request already exists.")
-                    else: st.error("User not found.")
+        f_search = st.text_input("Add Friend by Username").strip().lower()
+        if st.button("Send Request"):
+            with engine.connect() as conn:
+                f_res = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_search}).fetchone()
+                if f_res:
+                    try:
+                        conn.execute(text("INSERT INTO friendships (user_id, friend_id, status) VALUES (:u, :f, 'pending')"),
+                                     {"u": current_uid, "f": f_res[0]})
+                        conn.commit()
+                        st.success(f"Request sent to {f_search}!")
+                    except: st.warning("Request already exists or is pending.")
+                else: st.error("User not found.")
 
-        # 2. Accept Pending Requests
         st.subheader("Pending Requests")
         with engine.connect() as conn:
             pending = conn.execute(text("""
@@ -145,19 +139,16 @@ else:
                 WHERE f.friend_id = :uid AND f.status = 'pending'
             """), {"uid": current_uid}).fetchall()
             
-            if not pending: st.write("No new requests.")
             for req in pending:
                 c1, c2 = st.columns([2, 1])
-                c1.write(f"🤝 **{req[1]}** wants to be friends!")
+                c1.write(f"🤝 **{req[1]}** sent a request.")
                 if c2.button("Accept", key=f"acc_{req[0]}"):
                     conn.execute(text("UPDATE friendships SET status = 'accepted' WHERE id = :rid"), {"rid": req[0]})
                     conn.commit()
                     st.rerun()
 
-        # 3. List Official Friends
         st.subheader("Your Friends")
         with engine.connect() as conn:
-            # We check both directions for 'accepted' status
             friends_res = conn.execute(text("""
                 SELECT u.username, u.id FROM users u
                 JOIN friendships f ON (u.id = f.friend_id OR u.id = f.user_id)
@@ -166,7 +157,6 @@ else:
             """), {"uid": current_uid}).fetchall()
             
             accepted_friend_names = []
-            if not friends_res: st.write("Connect with others to plan trips together!")
             for fr in friends_res:
                 st.write(f"✅ {fr[0]}")
                 accepted_friend_names.append(fr[0])
@@ -182,10 +172,7 @@ else:
         if not park_names: st.warning("No parks found.")
         else:
             p_sel = st.selectbox("Select Park", options=park_names)
-            dates = st.text_input("Travel Dates", "Next month")
             nights = st.number_input("Nights", 1, 14, 3)
-            
-            # Use only ACCEPTED friends for invitations
             invited = st.multiselect("Invite Friends?", options=accepted_friend_names)
 
             if st.button("Generate & Save Trip"):
@@ -203,21 +190,27 @@ else:
                     
                     try:
                         with engine.connect() as conn:
-                            # 1. Create Trip (Matches your ERD: user_id AND owner_id)
+                            # 1. Create Trip (STATUS MUST BE 'planned')
                             tid_res = conn.execute(text("""
                                 INSERT INTO trips (user_id, owner_id, trip_name, status) 
-                                VALUES (:u, :o, :n, 'planning') RETURNING id
+                                VALUES (:u, :o, :n, 'planned') RETURNING id
                             """), {"u": current_uid, "o": current_uid, "n": f"{p_sel} Adventure"})
                             tid = tid_res.fetchone()[0]
 
-                            # 2. Add Participants
-                            conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role) VALUES (:t, :u, 'owner')"),
-                                         {"t": tid, "u": current_uid})
+                            # 2. Add Participants (Creator as Owner)
+                            conn.execute(text("""
+                                INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) 
+                                VALUES (:t, :u, 'owner', 'accepted', :u)
+                            """), {"t": tid, "u": current_uid})
+                            
                             for f_user in invited:
                                 fid = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_user}).fetchone()[0]
-                                conn.execute(text("INSERT INTO trip_participants (trip_id, user_id) VALUES (:t, :u)"), {"t": tid, "u": fid})
+                                conn.execute(text("""
+                                    INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) 
+                                    VALUES (:t, :u, 'collaborator', 'pending', :by)
+                                """), {"t": tid, "u": fid, "by": current_uid})
                             
-                            # 3. Save Park link
+                            # 3. Save Park Link
                             conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)"),
                                          {"t": tid, "p": p_id, "n": resp_text[:500]})
                             conn.commit()
@@ -225,11 +218,8 @@ else:
                         st.header(f"Trip to {p_sel}")
                         if p_info['image_url']: st.image(p_info['image_url'])
                         st.markdown(resp_text)
-                        
-                        with st.expander("⚠️ Safety Alerts"):
-                            for a in active_alerts: st.write(f"**{a['title']}**: {a['description']}")
                     except Exception as e:
-                        st.error(f"Integrity Error: Check your database columns. {e}")
+                        st.error(f"Save Failed: {e}")
 
     # --- MY TRIPS TAB ---
     with my_trips_tab:
@@ -240,6 +230,5 @@ else:
                 JOIN trip_participants tp ON t.id = tp.trip_id
                 WHERE tp.user_id = :u ORDER BY t.created_at DESC"""), {"u": current_uid}).fetchall()
             
-            if not my_trips: st.info("No trips yet. Go to 'Plan Trip' to start one!")
             for t in my_trips:
                 st.info(f"📍 {t[0]} | Status: {t[1]} | Created: {t[2].strftime('%Y-%m-%d')}")
