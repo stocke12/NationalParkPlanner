@@ -90,33 +90,67 @@ else:
 
     plan_tab, friend_tab, my_trips_tab = st.tabs(["🗺️ Plan Trip", "👥 Friends", "🎒 My Trips"])
 
-    # --- FRIENDS ---
+    # --- FRIENDS TAB ---
     with friend_tab:
         st.header("Social Hub")
-        f_search = st.text_input("Search User to Add").strip().lower()
+        
+        # SEARCH AND ADD
+        f_search = st.text_input("Search User by Username").strip().lower()
         if st.button("Send Request"):
             with engine.connect() as conn:
                 f_res = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_search}).fetchone()
                 if f_res:
-                    try:
-                        conn.execute(text("INSERT INTO friendships (user_id, friend_id, status) VALUES (:u, :f, 'pending')"),
-                                     {"u": current_uid, "f": f_res[0]})
-                        conn.commit()
-                        st.success("Request sent!")
-                    except: 
-                        st.warning("Request already exists.")
-                else: 
-                    st.error("User not found.")
+                    if f_res[0] == current_uid:
+                        st.warning("You can't friend yourself, Stockton!")
+                    else:
+                        try:
+                            conn.execute(text("INSERT INTO friendships (user_id, friend_id, status) VALUES (:u, :f, 'pending')"),
+                                         {"u": current_uid, "f": f_res[0]})
+                            conn.commit()
+                            st.success("Request sent!")
+                        except: st.warning("Request already exists or is pending.")
+                else: st.error("User not found.")
 
-        st.subheader("Pending Requests")
+        st.divider()
+        
+        # SHOW CURRENT FRIENDS
+        st.subheader("Your Adventure Crew")
+        with engine.connect() as conn:
+            # Union query to find friends where you are either the sender OR the receiver
+            friends_query = text("""
+                SELECT u.username, u.firstname, u.likes 
+                FROM users u
+                JOIN friendships f ON (u.id = f.friend_id OR u.id = f.user_id)
+                WHERE (f.user_id = :uid OR f.friend_id = :uid) 
+                AND f.status = 'accepted' 
+                AND u.id != :uid
+            """)
+            my_friends = conn.execute(friends_query, {"uid": current_uid}).fetchall()
+            
+            if not my_friends:
+                st.info("No friends found yet. Use the search above to grow your crew!")
+            else:
+                for f in my_friends:
+                    with st.container(border=True):
+                        st.write(f"**{f[1]}** (@{f[0]})")
+                        st.caption(f"Style: {f[2]}")
+
+        st.divider()
+
+        # SHOW PENDING REQUESTS
+        st.subheader("Incoming Requests")
         with engine.connect() as conn:
             pending = conn.execute(text("""
-                SELECT f.id, u.username FROM friendships f 
+                SELECT f.id, u.username 
+                FROM friendships f 
                 JOIN users u ON f.user_id = u.id 
                 WHERE f.friend_id = :uid AND f.status = 'pending'
             """), {"uid": current_uid}).fetchall()
+            
             for req in pending:
-                if st.button(f"Accept {req[1]}", key=f"acc_{req[0]}"):
+                c1, c2 = st.columns([0.7, 0.3])
+                c1.write(f"Request from **{req[1]}**")
+                if c2.button("Accept", key=f"acc_{req[0]}"):
                     conn.execute(text("UPDATE friendships SET status = 'accepted' WHERE id = :rid"), {"rid": req[0]})
                     conn.commit()
                     st.rerun()
