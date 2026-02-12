@@ -3,6 +3,7 @@ import os
 import pandas as pd
 import json
 import traceback
+from datetime import datetime
 from dotenv import load_dotenv
 from google import genai
 from sqlalchemy import text
@@ -103,6 +104,8 @@ if not st.session_state.logged_in:
 
 # --- MAIN APP ---
 else:
+    current_uid = st.session_state.user_info[0]
+    
     with st.sidebar:
         st.title("Settings")
         st.write(f"User: **{st.session_state.user_info[2]}**")
@@ -110,31 +113,65 @@ else:
             st.session_state.logged_in = False
             st.rerun()
 
-    # TABS FOR NAVIGATION
     plan_tab, friend_tab, my_trips_tab = st.tabs(["🗺️ Plan Trip", "👥 Friends", "🎒 My Trips"])
 
-    # FRIENDS TAB
+    # --- FRIENDS TAB (WITH PENDING REQUESTS) ---
     with friend_tab:
         st.header("Social Hub")
-        f_search = st.text_input("Find User by Username").strip().lower()
-        if st.button("Add Friend"):
-            with engine.connect() as conn:
-                f_res = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_search}).fetchone()
-                if f_res:
-                    conn.execute(text("INSERT INTO friendships (user_id, friend_id, status) VALUES (:u, :f, 'accepted')"),
-                                 {"u": st.session_state.user_info[0], "f": f_res[0]})
-                    conn.commit()
-                    st.success(f"Added {f_search}!")
-                else: st.error("User not found.")
         
+        # 1. Send Request
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            f_search = st.text_input("Add Friend by Username").strip().lower()
+        with col2:
+            if st.button("Send Request"):
+                with engine.connect() as conn:
+                    f_res = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_search}).fetchone()
+                    if f_res:
+                        try:
+                            conn.execute(text("INSERT INTO friendships (user_id, friend_id, status) VALUES (:u, :f, 'pending')"),
+                                         {"u": current_uid, "f": f_res[0]})
+                            conn.commit()
+                            st.success(f"Request sent to {f_search}!")
+                        except: st.warning("Request already exists.")
+                    else: st.error("User not found.")
+
+        # 2. Accept Pending Requests
+        st.subheader("Pending Requests")
+        with engine.connect() as conn:
+            pending = conn.execute(text("""
+                SELECT f.id, u.username FROM friendships f 
+                JOIN users u ON f.user_id = u.id 
+                WHERE f.friend_id = :uid AND f.status = 'pending'
+            """), {"uid": current_uid}).fetchall()
+            
+            if not pending: st.write("No new requests.")
+            for req in pending:
+                c1, c2 = st.columns([2, 1])
+                c1.write(f"🤝 **{req[1]}** wants to be friends!")
+                if c2.button("Accept", key=f"acc_{req[0]}"):
+                    conn.execute(text("UPDATE friendships SET status = 'accepted' WHERE id = :rid"), {"rid": req[0]})
+                    conn.commit()
+                    st.rerun()
+
+        # 3. List Official Friends
         st.subheader("Your Friends")
         with engine.connect() as conn:
-            friends = conn.execute(text("""
-                SELECT username FROM users JOIN friendships ON users.id = friendships.friend_id 
-                WHERE friendships.user_id = :uid"""), {"uid": st.session_state.user_info[0]}).fetchall()
-            for fr in friends: st.write(f"✅ {fr[0]}")
+            # We check both directions for 'accepted' status
+            friends_res = conn.execute(text("""
+                SELECT u.username, u.id FROM users u
+                JOIN friendships f ON (u.id = f.friend_id OR u.id = f.user_id)
+                WHERE ((f.user_id = :uid OR f.friend_id = :uid) AND f.status = 'accepted')
+                AND u.id != :uid
+            """), {"uid": current_uid}).fetchall()
+            
+            accepted_friend_names = []
+            if not friends_res: st.write("Connect with others to plan trips together!")
+            for fr in friends_res:
+                st.write(f"✅ {fr[0]}")
+                accepted_friend_names.append(fr[0])
 
-    # PLANNING TAB
+    # --- PLANNING TAB ---
     with plan_tab:
         try:
             with engine.connect() as conn:
@@ -148,9 +185,8 @@ else:
             dates = st.text_input("Travel Dates", "Next month")
             nights = st.number_input("Nights", 1, 14, 3)
             
-            # Collaboration Selection
-            friend_list = [f[0] for f in friends]
-            invited = st.multiselect("Invite Friends?", options=friend_list)
+            # Use only ACCEPTED friends for invitations
+            invited = st.multiselect("Invite Friends?", options=accepted_friend_names)
 
             if st.button("Generate & Save Trip"):
                 p_info = df_parks[df_parks['name'] == p_sel].iloc[0]
@@ -160,50 +196,50 @@ else:
                     al_res = conn.execute(text("SELECT title, description FROM alerts WHERE park_id = :p AND isactive=True"), {"p": p_id}).fetchall()
                     active_alerts = [{"title": r[0], "description": r[1]} for r in al_res]
 
-                prompt = f"""
-                Act as a Park Ranger. User likes {st.session_state.user_info[5]}. 
-                Plan {p_sel} for {nights} nights. Safety: {active_alerts}
-                Return a markdown itinerary then a JSON block at the very end like this:
-                DATA_START
-                [{{"day": 1, "activity": "Name", "notes": "Info"}}]
-                DATA_END
-                """
+                prompt = f"Act as Ranger. User likes {st.session_state.user_info[5]}. Plan {p_sel} for {nights} nights. Safety: {active_alerts}."
                 
                 with st.spinner("Ranger AI is planning..."):
-                    resp = client.models.generate_content(model="gemini-3-flash-preview", contents=prompt).text
-                    itinerary_main = resp.split("DATA_START")[0]
+                    resp_text = client.models.generate_content(model="gemini-3-flash-preview", contents=prompt).text
                     
-                    # DATABASE SAVING
-                    with engine.connect() as conn:
-                        # 1. Create Trip
-                        tid = conn.execute(text("INSERT INTO trips (user_id, trip_name) VALUES (:u, :n) RETURNING id"),
-                                           {"u": st.session_state.user_info[0], "n": f"{p_sel} Adventure"}).fetchone()[0]
-                        # 2. Add Participants
-                        conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role) VALUES (:t, :u, 'owner')"),
-                                     {"t": tid, "u": st.session_state.user_info[0]})
-                        for f_user in invited:
-                            fid = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_user}).fetchone()[0]
-                            conn.execute(text("INSERT INTO trip_participants (trip_id, user_id) VALUES (:t, :u)"), {"t": tid, "u": fid})
-                        
-                        # 3. Add Activity Notes to Trip_Parks
-                        conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)"),
-                                     {"t": tid, "p": p_id, "n": itinerary_main[:500]})
-                        conn.commit()
-                    
-                    st.header(f"Trip to {p_sel}")
-                    if p_info['image_url']: st.image(p_info['image_url'])
-                    st.markdown(itinerary_main)
-                    
-                    with st.expander("⚠️ Safety Alerts"):
-                        for a in active_alerts: st.write(f"**{a['title']}**: {a['description']}")
+                    try:
+                        with engine.connect() as conn:
+                            # 1. Create Trip (Matches your ERD: user_id AND owner_id)
+                            tid_res = conn.execute(text("""
+                                INSERT INTO trips (user_id, owner_id, trip_name, status) 
+                                VALUES (:u, :o, :n, 'planning') RETURNING id
+                            """), {"u": current_uid, "o": current_uid, "n": f"{p_sel} Adventure"})
+                            tid = tid_res.fetchone()[0]
 
-    # MY TRIPS TAB
+                            # 2. Add Participants
+                            conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role) VALUES (:t, :u, 'owner')"),
+                                         {"t": tid, "u": current_uid})
+                            for f_user in invited:
+                                fid = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_user}).fetchone()[0]
+                                conn.execute(text("INSERT INTO trip_participants (trip_id, user_id) VALUES (:t, :u)"), {"t": tid, "u": fid})
+                            
+                            # 3. Save Park link
+                            conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)"),
+                                         {"t": tid, "p": p_id, "n": resp_text[:500]})
+                            conn.commit()
+                            
+                        st.header(f"Trip to {p_sel}")
+                        if p_info['image_url']: st.image(p_info['image_url'])
+                        st.markdown(resp_text)
+                        
+                        with st.expander("⚠️ Safety Alerts"):
+                            for a in active_alerts: st.write(f"**{a['title']}**: {a['description']}")
+                    except Exception as e:
+                        st.error(f"Integrity Error: Check your database columns. {e}")
+
+    # --- MY TRIPS TAB ---
     with my_trips_tab:
         st.header("Your Saved Adventures")
         with engine.connect() as conn:
             my_trips = conn.execute(text("""
                 SELECT t.trip_name, t.status, t.created_at FROM trips t
                 JOIN trip_participants tp ON t.id = tp.trip_id
-                WHERE tp.user_id = :u"""), {"u": st.session_state.user_info[0]}).fetchall()
+                WHERE tp.user_id = :u ORDER BY t.created_at DESC"""), {"u": current_uid}).fetchall()
+            
+            if not my_trips: st.info("No trips yet. Go to 'Plan Trip' to start one!")
             for t in my_trips:
                 st.info(f"📍 {t[0]} | Status: {t[1]} | Created: {t[2].strftime('%Y-%m-%d')}")
