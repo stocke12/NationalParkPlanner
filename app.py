@@ -298,6 +298,13 @@ else:
                             st.toast(f"Added {name}")
             with c2:
                 st.subheader("📅 Full Day-by-Day Itinerary")
+                # ADD THIS — fetch and show park image
+                with engine.connect() as conn:
+                    park_img = conn.execute(
+                        text("SELECT image_url FROM parks WHERE name = :n"), {"n": p_sel}
+                    ).scalar()
+                    if park_img:
+                        st.image(park_img, use_container_width=True)
                 st.markdown(st.session_state.master_itinerary)
 
                 if st.button("💾 Save Everything"):
@@ -367,6 +374,7 @@ else:
                     t.end_date,
                     tpk.notes,
                     p.name AS park_name,
+                    p.image_url AS park_image,
                     u_owner.firstname || ' ' || u_owner.lastname AS owner_name,
                     tp.role
                 FROM trips t
@@ -390,6 +398,8 @@ else:
                 with st.expander(label):
                     col1, col2 = st.columns([2, 1])
                     with col1:
+                        if t.park_image:
+                            st.image(t.park_image, use_container_width=True)
                         st.caption(f"📅 {t.start_date} → {t.end_date}  •  🏔️ {t.park_name or 'Multiple Parks'}")
                         if t.role != "owner":
                             st.caption(f"Planned by **{t.owner_name}**")
