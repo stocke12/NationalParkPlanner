@@ -3,7 +3,7 @@ import os
 import pandas as pd
 import json
 import traceback
-from datetime import datetime
+from datetime import datetime, date
 from dotenv import load_dotenv
 from google import genai
 from sqlalchemy import text
@@ -59,10 +59,11 @@ def create_pdf(itinerary_text, park_name, user_name, alerts_list):
     if alerts_list:
         pdf.ln(10)
         pdf.set_font("Helvetica", 'B', 14)
-        pdf.cell(0, 10, "Safety Alerts:", ln=True)
+        pdf.cell(0, 10, "Current Safety Alerts:", ln=True)
+        pdf.set_font("Helvetica", size=10)
         for a in alerts_list:
-            pdf.set_font("Helvetica", size=10)
             pdf.multi_cell(0, 7, f"- {a['title']}: {a['description']}")
+            pdf.ln(2)
     return bytes(pdf.output())
 
 # --- AUTH ---
@@ -155,68 +156,106 @@ else:
         else:
             p_sel = st.selectbox("Select Park", options=park_names)
             
-            # --- THE RETURNED FIELDS ---
-            col_a, col_b = st.columns(2)
-            with col_a:
-                visit_dates = st.text_input("When are you going?", placeholder="e.g., July 15th")
-            with col_b:
-                nights = st.number_input("Nights", 1, 14, 3)
+            # --- UPDATED DATE PICKER ---
+            st.write("Select Trip Dates:")
+            date_range = st.date_input(
+                "Pick a start and end date",
+                value=(date.today(), date.today()),
+                min_value=date.today(),
+                format="MM/DD/YYYY"
+            )
+            
+            # Extract start and end from range
+            start_dt = date_range[0] if len(date_range) > 0 else date.today()
+            end_dt = date_range[1] if len(date_range) > 1 else start_dt
+            nights_calc = (end_dt - start_dt).days
+            
+            if nights_calc < 1:
+                st.caption("Please select a range of at least one night.")
+            else:
+                st.caption(f"Trip Duration: {nights_calc} nights")
             
             invited = st.multiselect("Invite Friends?", options=accepted_friend_names)
 
             if st.button("Generate & Save Trip"):
-                p_info = df_parks[df_parks['name'] == p_sel].iloc[0]
-                p_id = int(p_info['id'])
+                if len(date_range) < 2:
+                    st.error("Please select both a start and end date on the calendar.")
+                else:
+                    p_info = df_parks[df_parks['name'] == p_sel].iloc[0]
+                    p_id = int(p_info['id'])
 
-                with engine.connect() as conn:
-                    al_res = conn.execute(text("SELECT title, description FROM alerts WHERE park_id = :p AND isactive=True"), {"p": p_id}).fetchall()
-                    active_alerts = [{"title": r[0], "description": r[1]} for r in al_res]
+                    with engine.connect() as conn:
+                        al_res = conn.execute(text("SELECT title, description FROM alerts WHERE park_id = :p AND isactive=True"), {"p": p_id}).fetchall()
+                        active_alerts = [{"title": r[0], "description": r[1]} for r in al_res]
 
-                prompt = f"Act as Ranger. User likes {st.session_state.user_info[5]}. Plan {p_sel} for {nights} nights starting {visit_dates}. Safety: {active_alerts}."
-                
-                with st.spinner("Ranger AI is planning..."):
-                    resp_text = client.models.generate_content(model="gemini-3-flash-preview", contents=prompt).text
+                    prompt = f"""
+                    You are Ranger Gemini. Plan a trip to {p_sel}.
+                    Dates: {start_dt} to {end_dt} ({nights_calc} nights).
+                    Style: {st.session_state.user_info[5]}.
+                    Alerts: {active_alerts}.
+                    Professional day-by-day itinerary.
+                    """
                     
-                    try:
-                        with engine.connect() as conn:
-                            # 1. Create Trip (STATUS 'planned')
-                            tid_res = conn.execute(text("""
-                                INSERT INTO trips (user_id, owner_id, trip_name, status, notes) 
-                                VALUES (:u, :o, :n, 'planned', :dates) RETURNING id
-                            """), {"u": current_uid, "o": current_uid, "n": f"{p_sel} Adventure", "dates": f"Trip Date: {visit_dates}"})
-                            tid = tid_res.fetchone()[0]
-
-                            # 2. Add Participants
-                            conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t, :u, 'owner', 'accepted', :u)"), {"t": tid, "u": current_uid})
-                            for f_user in invited:
-                                fid = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_user}).fetchone()[0]
-                                conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t, :u, 'collaborator', 'pending', :by)"), {"t": tid, "u": fid, "by": current_uid})
-                            
-                            # 3. Save Park Link
-                            conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)"), {"t": tid, "p": p_id, "n": resp_text[:1000]})
-                            conn.commit()
-                            
-                        st.header(f"Trip to {p_sel}")
-                        if p_info['image_url']: st.image(p_info['image_url'])
-                        st.markdown(resp_text)
+                    with st.spinner("Ranger Gemini is planning..."):
+                        resp_text = client.models.generate_content(model="gemini-3-flash-preview", contents=prompt).text
                         
-                        with st.expander("⚠️ Safety Alerts"):
-                            for a in active_alerts: st.write(f"**{a['title']}**: {a['description']}")
+                        try:
+                            with engine.connect() as conn:
+                                # 1. Create Trip (Saving real DATE objects now)
+                                tid_res = conn.execute(text("""
+                                    INSERT INTO trips (user_id, owner_id, trip_name, status, start_date, end_date) 
+                                    VALUES (:u, :o, :n, 'planned', :sd, :ed) RETURNING id
+                                """), {
+                                    "u": current_uid, 
+                                    "o": current_uid, 
+                                    "n": f"{p_sel} Adventure",
+                                    "sd": start_dt,
+                                    "ed": end_dt
+                                })
+                                tid = tid_res.fetchone()[0]
+
+                                # 2. Participants
+                                conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t, :u, 'owner', 'accepted', :u)"), {"t": tid, "u": current_uid})
+                                for f_user in invited:
+                                    fid = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_user}).fetchone()[0]
+                                    conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t, :u, 'collaborator', 'pending', :by)"), {"t": tid, "u": fid, "by": current_uid})
+                                
+                                # 3. Save Park Link
+                                conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)"), {"t": tid, "p": p_id, "n": resp_text[:1500]})
+                                conn.commit()
+                                
+                            st.divider()
+                            if p_info['image_url']: 
+                                st.image(p_info['image_url'], use_container_width=True)
                             
-                        pdf_bytes = create_pdf(resp_text, p_sel, st.session_state.user_info[2], active_alerts)
-                        st.download_button("📥 Download PDF", pdf_bytes, f"{p_sel}.pdf", "application/pdf")
-                    except Exception as e:
-                        st.error(f"Save Failed: {e}")
+                            st.header(f"Your Itinerary for {p_sel}")
+                            st.markdown(resp_text)
+                            
+                            st.divider()
+                            if active_alerts:
+                                with st.expander(f"⚠️ Important Safety Alerts", expanded=True):
+                                    for a in active_alerts:
+                                        st.subheader(a['title'])
+                                        st.write(a['description'])
+                                
+                            pdf_bytes = create_pdf(resp_text, p_sel, st.session_state.user_info[2], active_alerts)
+                            st.download_button("📥 Download PDF", pdf_bytes, f"{p_sel.replace(' ', '_')}.pdf", "application/pdf")
+                        
+                        except Exception as e:
+                            st.error(f"Save Failed: {e}")
 
     # --- MY TRIPS ---
     with my_trips_tab:
         st.header("Your Saved Adventures")
         with engine.connect() as conn:
             my_trips = conn.execute(text("""
-                SELECT t.trip_name, t.status, t.created_at, t.notes FROM trips t
+                SELECT t.trip_name, t.status, t.start_date, t.end_date FROM trips t
                 JOIN trip_participants tp ON t.id = tp.trip_id
-                WHERE tp.user_id = :u ORDER BY t.created_at DESC"""), {"u": current_uid}).fetchall()
+                WHERE tp.user_id = :u ORDER BY t.start_date DESC"""), {"u": current_uid}).fetchall()
+            
+            if not my_trips:
+                st.info("No trips yet!")
             for t in my_trips:
-                with st.expander(f"📍 {t[0]} ({t[3] if t[3] else 'No date set'})"):
-                    st.write(f"Status: {t[1]}")
-                    st.write(f"Created on: {t[2].strftime('%Y-%m-%d')}")
+                date_str = f"{t[2]} to {t[3]}" if t[2] else "Dates not set"
+                with st.expander(f"📍 {t[0]} ({date_str})"):
+                    st.write(f"**Status:** {t[1]}")
