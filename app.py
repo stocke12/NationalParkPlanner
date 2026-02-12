@@ -221,7 +221,7 @@ else:
                                     conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t, :u, 'collaborator', 'pending', :by)"), {"t": tid, "u": fid, "by": current_uid})
                                 
                                 # 3. Save Park Link
-                                conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)"), {"t": tid, "p": p_id, "n": resp_text[:1500]})
+                                conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)"), {"t": tid, "p": p_id, "n": resp_text})
                                 conn.commit()
                                 
                             st.divider()
