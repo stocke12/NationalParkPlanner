@@ -460,16 +460,32 @@ else:
                 st.session_state.nights = nights
                 st.session_state.day_activities = {i + 1: [] for i in range(nights + 1)}
 
+                # Build group travel styles for the prompt
+                travel_styles = [f"{st.session_state.user_info['firstname']}: {st.session_state.user_info['likes']}"]
+                if invite_roles:
+                    with engine.connect() as conn:
+                        for fname in invite_roles.keys():
+                            friend_likes = conn.execute(
+                                text("SELECT firstname, likes FROM users WHERE username = :u"), {"u": fname}
+                            ).fetchone()
+                            if friend_likes and friend_likes.likes:
+                                travel_styles.append(f"{friend_likes.firstname}: {friend_likes.likes}")
+
+                group_styles = "\n".join(f"  - {s}" for s in travel_styles)
+                group_note = f"This is a group trip. Balance activities for everyone's styles:\n{group_styles}" if len(travel_styles) > 1 else f"Travel Style: {st.session_state.user_info['likes']}"
+
                 prompt = f"""
-                Suggest 12 individual activities for {p_sel} (Travel Style: {st.session_state.user_info['likes']}).
+                Suggest 12 individual activities for {p_sel}.
+                {group_note}
                 Format each as: Name | Type | Brief description
                 Only return the list, one activity per line.
 
                 ---MASTER_ITINERARY---
                 Provide a full day-by-day itinerary for {nights} nights at {p_sel}.
+                {group_note}
                 """
                 with st.spinner("Scouting the trail..."):
-                    resp = client.models.generate_content(model="gemini-3-flash-preview", contents=prompt).text
+                    resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text
                     parts = resp.split('---MASTER_ITINERARY---')
                     st.session_state.temp_activities = [l for l in parts[0].strip().split('\n') if "|" in l]
                     st.session_state.master_itinerary = parts[1].strip() if len(parts) > 1 else ""
