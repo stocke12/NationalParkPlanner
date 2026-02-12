@@ -76,6 +76,8 @@ def can_edit(role):
 
 def date_range_days(start, end):
     """Returns list of (day_number, date) tuples for a trip."""
+    if not start or not end:
+        return []
     days = []
     current = start if isinstance(start, date) else date.fromisoformat(str(start))
     end_d = end if isinstance(end, date) else date.fromisoformat(str(end))
@@ -674,8 +676,8 @@ else:
                         st.markdown("### ✏️ Edit Trip")
 
                         new_name = st.text_input("Trip Name", value=t.trip_name, key=f"name_{t.id}")
-                        start = t.start_date if isinstance(t.start_date, date) else date.fromisoformat(str(t.start_date))
-                        end = t.end_date if isinstance(t.end_date, date) else date.fromisoformat(str(t.end_date))
+                        start = t.start_date if isinstance(t.start_date, date) else (date.fromisoformat(str(t.start_date)) if t.start_date else date.today())
+                        end = t.end_date if isinstance(t.end_date, date) else (date.fromisoformat(str(t.end_date)) if t.end_date else date.today())
                         new_dates = st.date_input("Dates", value=(start, end), key=f"dates_{t.id}")
                         new_park = st.selectbox(
                             "Park", options=all_parks['name'],
