@@ -48,7 +48,6 @@ def create_pdf(itinerary_text, park_name, user_name):
     return bytes(pdf.output())
 
 def get_pending_trip_invites(conn, uid):
-    """Returns all pending trip invitations for a user."""
     return conn.execute(text("""
         SELECT 
             tp.id AS participant_id,
@@ -69,7 +68,6 @@ def get_pending_trip_invites(conn, uid):
     """), {"uid": uid}).fetchall()
 
 def get_pending_count(uid):
-    """Returns total pending friend requests + trip invites for badge display."""
     with engine.connect() as conn:
         friend_count = conn.execute(text("""
             SELECT COUNT(*) FROM friendships 
@@ -80,6 +78,10 @@ def get_pending_count(uid):
             WHERE user_id = :uid AND invitation_status = 'pending' AND role != 'owner'
         """), {"uid": uid}).scalar()
     return (friend_count or 0) + (trip_count or 0)
+
+def can_edit(role):
+    """Returns True if the user's role allows editing."""
+    return role in ('owner', 'collaborator')
 
 # --- AUTH ---
 if not st.session_state.logged_in:
@@ -119,7 +121,6 @@ if not st.session_state.logged_in:
 else:
     current_uid = st.session_state.user_info['id']
 
-    # Sidebar
     with st.sidebar:
         st.write(f"Welcome back, **{st.session_state.user_info['firstname']}**")
         pending_count = get_pending_count(current_uid)
@@ -130,11 +131,7 @@ else:
             st.session_state.user_info = None
             st.rerun()
 
-    # Tab labels with notification badges
-    friend_label = "👥 Friends"
-    trips_label = "🎒 My Trips"
-
-    plan_tab, friend_tab, my_trips_tab = st.tabs(["🗺️ Plan Trip", friend_label, trips_label])
+    plan_tab, friend_tab, my_trips_tab = st.tabs(["🗺️ Plan Trip", "👥 Friends", "🎒 My Trips"])
 
     # ─────────────────────────────────────────────
     # FRIENDS TAB
@@ -142,7 +139,6 @@ else:
     with friend_tab:
         st.header("Social Hub")
 
-        # Search and Add
         f_search = st.text_input("Search User by Username").strip().lower()
         if st.button("Send Friend Request"):
             with engine.connect() as conn:
@@ -165,7 +161,6 @@ else:
 
         st.divider()
 
-        # Current Friends
         st.subheader("Your Adventure Crew")
         with engine.connect() as conn:
             my_friends = conn.execute(text("""
@@ -187,7 +182,6 @@ else:
 
         st.divider()
 
-        # Incoming Friend Requests
         st.subheader("Incoming Friend Requests")
         with engine.connect() as conn:
             pending = conn.execute(text("""
@@ -210,7 +204,6 @@ else:
 
         st.divider()
 
-        # ── NEW: Incoming Trip Invites in Friends tab ──
         st.subheader("Incoming Trip Invites")
         with engine.connect() as conn:
             trip_invites = get_pending_trip_invites(conn, current_uid)
@@ -253,16 +246,33 @@ else:
     with plan_tab:
         with engine.connect() as conn:
             friends_res = conn.execute(text("""
-                SELECT u.username FROM users u
+                SELECT u.id, u.username FROM users u
                 JOIN friendships f ON (u.id = f.friend_id OR u.id = f.user_id)
                 WHERE ((f.user_id = :uid OR f.friend_id = :uid) AND f.status = 'accepted') AND u.id != :uid
             """), {"uid": current_uid}).fetchall()
-            friend_names = [fr[0] for fr in friends_res]
+            friend_options = {fr[1]: fr[0] for fr in friends_res}  # {username: id}
             df_parks = pd.read_sql(text("SELECT name, id FROM parks ORDER BY name"), conn)
 
         p_sel = st.selectbox("Select Park", options=df_parks['name'])
         date_range = st.date_input("Dates", value=(date.today(), date.today()))
-        st.multiselect("Invite Friends?", options=friend_names, key="invited_friends")
+
+        # ── Per-friend role selector on invite ──
+        st.markdown("**Invite Friends**")
+        invite_roles = {}
+        if friend_options:
+            for fname in friend_options:
+                col1, col2 = st.columns([0.6, 0.4])
+                include = col1.checkbox(fname, key=f"invite_check_{fname}")
+                if include:
+                    role = col2.selectbox(
+                        "Role",
+                        options=["collaborator", "viewer"],
+                        key=f"invite_role_{fname}",
+                        help="Collaborators can edit the trip. Viewers can only see it."
+                    )
+                    invite_roles[fname] = role
+        else:
+            st.caption("Add friends to invite them to trips.")
 
         if st.button("Generate Plan"):
             if len(date_range) < 2:
@@ -298,7 +308,6 @@ else:
                             st.toast(f"Added {name}")
             with c2:
                 st.subheader("📅 Full Day-by-Day Itinerary")
-                # ADD THIS — fetch and show park image
                 with engine.connect() as conn:
                     park_img = conn.execute(
                         text("SELECT image_url FROM parks WHERE name = :n"), {"n": p_sel}
@@ -310,7 +319,6 @@ else:
                 if st.button("💾 Save Everything"):
                     try:
                         with engine.begin() as conn:
-                            # 1. Insert the Trip
                             tid_res = conn.execute(text("""
                                 INSERT INTO trips (user_id, owner_id, trip_name, start_date, end_date) 
                                 VALUES (:u, :u, :n, :s, :e) RETURNING id
@@ -322,26 +330,21 @@ else:
                             }).fetchone()
                             tid = tid_res[0]
 
-                            # 2. Add Owner
                             conn.execute(text("""
                                 INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) 
                                 VALUES (:t, :u, 'owner', 'accepted', :u)
                             """), {"t": tid, "u": current_uid})
 
-                            # 3. Add Invited Friends — FIX: role='collaborator', include invited_by
-                            if st.session_state.invited_friends:
-                                for f_name in st.session_state.invited_friends:
-                                    fid_res = conn.execute(
-                                        text("SELECT id FROM users WHERE username = :u"), {"u": f_name}
-                                    ).fetchone()
-                                    if fid_res:
-                                        conn.execute(text("""
-                                            INSERT INTO trip_participants 
-                                                (trip_id, user_id, role, invitation_status, invited_by) 
-                                            VALUES (:t, :u, 'collaborator', 'pending', :inviter)
-                                        """), {"t": tid, "u": fid_res[0], "inviter": current_uid})
+                            # Insert friends with their individual roles
+                            for f_name, f_role in invite_roles.items():
+                                fid = friend_options.get(f_name)
+                                if fid:
+                                    conn.execute(text("""
+                                        INSERT INTO trip_participants 
+                                            (trip_id, user_id, role, invitation_status, invited_by) 
+                                        VALUES (:t, :u, :role, 'pending', :inviter)
+                                    """), {"t": tid, "u": fid, "role": f_role, "inviter": current_uid})
 
-                            # 4. Save Park & Itinerary
                             p_id = int(df_parks[df_parks['name'] == p_sel]['id'].iloc[0])
                             final_notes = (
                                 f"MASTER ITINERARY:\n{st.session_state.master_itinerary}\n\n"
@@ -359,19 +362,19 @@ else:
                         st.error(f"Database Error: {e}")
 
     # ─────────────────────────────────────────────
-    # MY TRIPS TAB — now shows owned AND accepted trips
+    # MY TRIPS TAB — inline editing with permissions
     # ─────────────────────────────────────────────
     with my_trips_tab:
         st.header("Your Adventures")
 
         with engine.connect() as conn:
-            # ── NEW: Fetch trips the user owns OR has accepted an invite for
             trips = conn.execute(text("""
                 SELECT DISTINCT
                     t.id,
                     t.trip_name,
                     t.start_date,
                     t.end_date,
+                    tpk.id AS trip_park_id,
                     tpk.notes,
                     p.name AS park_name,
                     p.image_url AS park_image,
@@ -386,33 +389,126 @@ else:
                   AND tp.invitation_status = 'accepted'
                 ORDER BY t.start_date DESC
             """), {"uid": current_uid}).fetchall()
+            all_parks = pd.read_sql(text("SELECT name, id FROM parks ORDER BY name"), conn)
 
         if not trips:
             st.info("No trips yet! Head to the Plan Trip tab to start your first adventure 🏕️")
         else:
             for t in trips:
-                # Badge for owned vs shared trips
-                role_badge = "👑 Owner" if t.role == "owner" else "🤝 Invited"
+                role_badge = "👑 Owner" if t.role == "owner" else "✏️ Collaborator" if t.role == "collaborator" else "👁️ Viewer"
                 label = f"📍 {t.trip_name}  —  {role_badge}"
+                editable = can_edit(t.role)
 
                 with st.expander(label):
-                    col1, col2 = st.columns([2, 1])
-                    with col1:
-                        if t.park_image:
-                            st.image(t.park_image, use_container_width=True)
+                    if t.park_image:
+                        st.image(t.park_image, use_container_width=True)
+
+                    edit_key = f"editing_{t.id}"
+                    if edit_key not in st.session_state:
+                        st.session_state[edit_key] = False
+
+                    col_info, col_btn = st.columns([3, 1])
+                    with col_info:
                         st.caption(f"📅 {t.start_date} → {t.end_date}  •  🏔️ {t.park_name or 'Multiple Parks'}")
                         if t.role != "owner":
                             st.caption(f"Planned by **{t.owner_name}**")
-                    with col2:
+                    with col_btn:
+                        if editable:
+                            toggle_label = "Cancel" if st.session_state[edit_key] else "✏️ Edit Trip"
+                            if st.button(toggle_label, key=f"toggle_edit_{t.id}"):
+                                st.session_state[edit_key] = not st.session_state[edit_key]
+                                st.rerun()
                         if t.notes:
                             pdf_b = create_pdf(t.notes, t.trip_name, st.session_state.user_info['firstname'])
-                            st.download_button("📥 Download PDF", pdf_b, f"Trip_{t.id}.pdf", key=f"dl_{t.id}")
+                            st.download_button("📥 PDF", pdf_b, f"Trip_{t.id}.pdf", key=f"dl_{t.id}")
 
-                    if t.notes:
+                    # ── INLINE EDIT FORM ──
+                    if editable and st.session_state[edit_key]:
                         st.divider()
-                        st.markdown(t.notes)
+                        st.markdown("### ✏️ Edit Trip")
 
-                    # Show who else is on this trip
+                        new_name = st.text_input("Trip Name", value=t.trip_name, key=f"name_{t.id}")
+                        new_dates = st.date_input(
+                            "Dates",
+                            value=(t.start_date, t.end_date),
+                            key=f"dates_{t.id}"
+                        )
+                        new_park = st.selectbox(
+                            "Park",
+                            options=all_parks['name'],
+                            index=int(all_parks[all_parks['name'] == t.park_name].index[0]) if t.park_name in all_parks['name'].values else 0,
+                            key=f"park_{t.id}"
+                        )
+                        new_notes = st.text_area(
+                            "Itinerary Notes",
+                            value=t.notes or "",
+                            height=300,
+                            key=f"notes_{t.id}"
+                        )
+
+                        # ── Owner-only: manage participant roles ──
+                        if t.role == "owner":
+                            st.markdown("**Manage Participant Permissions**")
+                            with engine.connect() as conn2:
+                                participants = conn2.execute(text("""
+                                    SELECT tp.id, u.username, u.firstname, tp.role, tp.invitation_status
+                                    FROM trip_participants tp
+                                    JOIN users u ON tp.user_id = u.id
+                                    WHERE tp.trip_id = :tid AND tp.role != 'owner'
+                                """), {"tid": t.id}).fetchall()
+
+                            for p in participants:
+                                pc1, pc2, pc3 = st.columns([2, 2, 1])
+                                pc1.write(f"**{p.firstname}** (@{p.username})")
+                                pc1.caption(f"Status: {p.invitation_status}")
+                                new_role = pc2.selectbox(
+                                    "Role",
+                                    options=["collaborator", "viewer"],
+                                    index=0 if p.role == "collaborator" else 1,
+                                    key=f"role_{t.id}_{p.id}"
+                                )
+                                if pc3.button("Update", key=f"update_role_{t.id}_{p.id}"):
+                                    with engine.connect() as conn2:
+                                        conn2.execute(text("""
+                                            UPDATE trip_participants SET role = :r WHERE id = :pid
+                                        """), {"r": new_role, "pid": p.id})
+                                        conn2.commit()
+                                    st.success(f"Updated {p.firstname}'s role to {new_role}.")
+                                    st.rerun()
+
+                        if st.button("💾 Save Changes", key=f"save_{t.id}"):
+                            try:
+                                new_park_id = int(all_parks[all_parks['name'] == new_park]['id'].iloc[0])
+                                with engine.begin() as conn2:
+                                    conn2.execute(text("""
+                                        UPDATE trips 
+                                        SET trip_name = :name, start_date = :s, end_date = :e
+                                        WHERE id = :tid
+                                    """), {
+                                        "name": new_name,
+                                        "s": new_dates[0] if len(new_dates) > 1 else t.start_date,
+                                        "e": new_dates[1] if len(new_dates) > 1 else t.end_date,
+                                        "tid": t.id
+                                    })
+                                    conn2.execute(text("""
+                                        UPDATE trip_parks 
+                                        SET park_id = :p, notes = :n
+                                        WHERE id = :tpkid
+                                    """), {"p": new_park_id, "n": new_notes, "tpkid": t.trip_park_id})
+
+                                st.success("Trip updated! ✅")
+                                st.session_state[edit_key] = False
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error saving: {e}")
+
+                    # ── READ-ONLY VIEW ──
+                    else:
+                        if t.notes:
+                            st.divider()
+                            st.markdown(t.notes)
+
+                    # Trip crew (always visible)
                     with engine.connect() as conn2:
                         participants = conn2.execute(text("""
                             SELECT u.firstname, u.lastname, u.username, tp.role, tp.invitation_status
@@ -427,4 +523,5 @@ else:
                         st.markdown("**Trip Crew:**")
                         for p in participants:
                             status_icon = "✅" if p.invitation_status == "accepted" else "⏳" if p.invitation_status == "pending" else "❌"
-                            st.caption(f"{status_icon} {p.firstname} {p.lastname} (@{p.username}) — {p.role}")
+                            role_icon = "👑" if p.role == "owner" else "✏️" if p.role == "collaborator" else "👁️"
+                            st.caption(f"{status_icon} {p.firstname} {p.lastname} (@{p.username}) — {role_icon} {p.role}")
