@@ -669,6 +669,7 @@ else:
                         act_name = act_parts[0].strip()
                         suggested = guess_day_for_activity(act_name, day_map, default_day=1)
                         defaults[i] = suggested
+                        defaults[str(i)] = suggested  # store as both int and str for Streamlit session state safety
                         widget_key = f"target_day_{i}"
                         if widget_key in st.session_state:
                             del st.session_state[widget_key]
@@ -694,11 +695,13 @@ else:
                             st.caption(f"💡 {leg['tip']}")
 
         # ── ACTIVITY PICKER + DAY-BY-DAY BOARD ──
+        # Always use session-state values written at generate time — never fall back
+        # to live widget values, which can drift on reruns and break the board.
         active_parks = st.session_state.get("selected_parks") or selected_parks
-        board_start = st.session_state.trip_start or (date_range[0] if len(date_range) == 2 else None)
-        board_end = st.session_state.trip_end or (date_range[1] if len(date_range) == 2 else None)
+        board_start = st.session_state.trip_start
+        board_end = st.session_state.trip_end
 
-        if st.session_state.temp_activities and board_start and board_end and active_parks:
+        if st.session_state.temp_activities and board_start and board_end:
             st.divider()
             days = date_range_days(board_start, board_end)
 
@@ -724,7 +727,7 @@ else:
                     name = parts[0].strip()
                     a_type = parts[1].strip() if len(parts) > 1 else "Activity"
                     a_park = parts[2].strip() if len(parts) > 2 else ""
-                    suggested_day = st.session_state.activity_day_defaults.get(i, 1)
+                    suggested_day = st.session_state.activity_day_defaults.get(i) or st.session_state.activity_day_defaults.get(str(i), 1)
                     if suggested_day not in day_options:
                         suggested_day = day_options[0] if day_options else 1
                     sorted_activities.append((i, name, a_type, a_park, suggested_day))
@@ -1109,7 +1112,7 @@ else:
 
                     # ── READ-ONLY VIEW ──
                     else:
-                        # ── ACTIVITIES ──
+                        # Fetch activities
                         with engine.connect() as conn2:
                             saved_acts = conn2.execute(text("""
                                 SELECT day_number, activity_name, activity_type
@@ -1117,73 +1120,76 @@ else:
                                 ORDER BY day_number, sort_order
                             """), {"tid": t.id}).fetchall()
 
-                        if saved_acts:
-                            st.divider()
-                            st.markdown("**Trip Activities:**")
-                            view_days = date_range_days(t.start_date, t.end_date)
-                            day_act_map = {}
-                            for a in saved_acts:
-                                day_act_map.setdefault(a.day_number, []).append(a)
+                        # Fetch journal notes
+                        with engine.connect() as conn2:
+                            all_notes_rows = conn2.execute(text("""
+                                SELECT tdn.id, tdn.day_number, tdn.note_text, tdn.created_at,
+                                       u.firstname, u.lastname, tdn.author_id
+                                FROM trip_day_notes tdn
+                                JOIN users u ON tdn.author_id = u.id
+                                WHERE tdn.trip_id = :tid
+                                ORDER BY tdn.day_number, tdn.created_at
+                            """), {"tid": t.id}).fetchall()
+                        notes_by_day = {}
+                        for n in all_notes_rows:
+                            notes_by_day.setdefault(n.day_number, []).append(n)
 
-                            # ── TRIP NOTES / JOURNAL per day ──
-                            with engine.connect() as conn2:
-                                all_notes_rows = conn2.execute(text("""
-                                    SELECT tdn.id, tdn.day_number, tdn.note_text, tdn.created_at,
-                                           u.firstname, u.lastname, tdn.author_id
-                                    FROM trip_day_notes tdn
-                                    JOIN users u ON tdn.author_id = u.id
-                                    WHERE tdn.trip_id = :tid
-                                    ORDER BY tdn.day_number, tdn.created_at
-                                """), {"tid": t.id}).fetchall()
-                            notes_by_day = {}
-                            for n in all_notes_rows:
-                                notes_by_day.setdefault(n.day_number, []).append(n)
+                        # Build activity map
+                        day_act_map = {}
+                        for a in saved_acts:
+                            day_act_map.setdefault(a.day_number, []).append(a)
 
-                            for day_num, day_date in view_days:
-                                acts = day_act_map.get(day_num, [])
-                                day_notes = notes_by_day.get(day_num, [])
-                                if acts or day_notes:
-                                    with st.container(border=True):
-                                        st.markdown(f"**Day {day_num} — {day_date.strftime('%a, %b %d')}**")
-                                        # Activities
-                                        for a in acts:
-                                            st.caption(f"  • {a.activity_name} _{a.activity_type}_")
+                        # ── DAY-BY-DAY: activities + journal (always shown for every day) ──
+                        view_days = date_range_days(t.start_date, t.end_date)
+                        st.divider()
+                        st.markdown("**📅 Day-by-Day:**")
+                        for day_num, day_date in view_days:
+                            acts = day_act_map.get(day_num, [])
+                            day_notes = notes_by_day.get(day_num, [])
+                            with st.container(border=True):
+                                st.markdown(f"**Day {day_num} — {day_date.strftime('%a, %b %d')}**")
 
-                                        # Existing notes
-                                        if day_notes:
-                                            st.markdown("📝 **Notes:**")
-                                            for note in day_notes:
-                                                is_mine = note.author_id == current_uid
-                                                note_col1, note_col2 = st.columns([8, 1])
-                                                note_col1.markdown(
-                                                    f"> {note.note_text}  \n"
-                                                    f"<small>— {note.firstname} {note.lastname}, "
-                                                    f"{note.created_at.strftime('%b %d') if hasattr(note.created_at, 'strftime') else note.created_at}</small>",
-                                                    unsafe_allow_html=True
-                                                )
-                                                if is_mine:
-                                                    if note_col2.button("🗑️", key=f"del_note_{note.id}"):
-                                                        with engine.begin() as conn2:
-                                                            conn2.execute(text("DELETE FROM trip_day_notes WHERE id=:nid"), {"nid": note.id})
-                                                        st.rerun()
+                                # Activities
+                                if acts:
+                                    for a in acts:
+                                        st.caption(f"  • {a.activity_name} _{a.activity_type}_")
+                                else:
+                                    st.caption("  _(no activities planned)_")
 
-                                        # Add note form (collaborators + owner)
-                                        if editable or t.role == "viewer":
-                                            note_key = f"note_input_{t.id}_{day_num}"
-                                            new_note = st.text_input(
-                                                f"Add a note for Day {day_num}",
-                                                placeholder="How did it go? Any tips for future visitors?",
-                                                key=note_key,
-                                                label_visibility="collapsed"
-                                            )
-                                            if st.button("💬 Add Note", key=f"add_note_{t.id}_{day_num}"):
-                                                if new_note.strip():
-                                                    with engine.begin() as conn2:
-                                                        conn2.execute(text("""
-                                                            INSERT INTO trip_day_notes (trip_id, day_number, author_id, note_text)
-                                                            VALUES (:tid, :day, :uid, :note)
-                                                        """), {"tid": t.id, "day": day_num, "uid": current_uid, "note": new_note.strip()})
-                                                    st.rerun()
+                                # Existing notes
+                                if day_notes:
+                                    st.markdown("📝 **Notes:**")
+                                    for note in day_notes:
+                                        is_mine = note.author_id == current_uid
+                                        note_col1, note_col2 = st.columns([8, 1])
+                                        note_col1.markdown(
+                                            f"> {note.note_text}  \n"
+                                            f"<small>— {note.firstname} {note.lastname}, "
+                                            f"{note.created_at.strftime('%b %d') if hasattr(note.created_at, 'strftime') else note.created_at}</small>",
+                                            unsafe_allow_html=True
+                                        )
+                                        if is_mine:
+                                            if note_col2.button("🗑️", key=f"del_note_{note.id}"):
+                                                with engine.begin() as conn2:
+                                                    conn2.execute(text("DELETE FROM trip_day_notes WHERE id=:nid"), {"nid": note.id})
+                                                st.rerun()
+
+                                # Add note form — available to all participants
+                                note_key = f"note_input_{t.id}_{day_num}"
+                                new_note = st.text_input(
+                                    f"Add a note for Day {day_num}",
+                                    placeholder="How did it go? Any tips for future visitors?",
+                                    key=note_key,
+                                    label_visibility="collapsed"
+                                )
+                                if st.button("💬 Add Note", key=f"add_note_{t.id}_{day_num}"):
+                                    if new_note.strip():
+                                        with engine.begin() as conn2:
+                                            conn2.execute(text("""
+                                                INSERT INTO trip_day_notes (trip_id, day_number, author_id, note_text)
+                                                VALUES (:tid, :day, :uid, :note)
+                                            """), {"tid": t.id, "day": day_num, "uid": current_uid, "note": new_note.strip()})
+                                        st.rerun()
 
                         # ── PACKING LIST ──
                         with engine.connect() as conn2:
