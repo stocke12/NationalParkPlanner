@@ -488,23 +488,68 @@ else:
     with friend_tab:
         st.header("Social Hub")
 
-        f_search = st.text_input("Search User by Username").strip().lower()
-        if st.button("Send Friend Request"):
+        f_search = st.text_input("Search by username, first name, or last name").strip()
+        if f_search:
             with engine.connect() as conn:
-                f_res = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": f_search}).fetchone()
-                if f_res:
-                    if f_res[0] == current_uid:
-                        st.warning("You can't friend yourself!")
-                    else:
-                        try:
-                            conn.execute(text("INSERT INTO friendships (user_id, friend_id, status) VALUES (:u, :f, 'pending')"),
-                                         {"u": current_uid, "f": f_res[0]})
-                            conn.commit()
-                            st.success("Friend request sent!")
-                        except Exception:
-                            st.warning("Request already exists or is pending.")
-                else:
-                    st.error("User not found.")
+                search_results = conn.execute(text("""
+                    SELECT u.id, u.username, u.firstname, u.lastname, u.likes,
+                        CASE
+                            WHEN f.id IS NOT NULL AND f.status = 'accepted' THEN 'friends'
+                            WHEN f.id IS NOT NULL AND f.status = 'pending'
+                                 AND f.user_id = :uid THEN 'request_sent'
+                            WHEN f.id IS NOT NULL AND f.status = 'pending'
+                                 AND f.friend_id = :uid THEN 'request_received'
+                            ELSE 'none'
+                        END AS friendship_status
+                    FROM users u
+                    LEFT JOIN friendships f
+                        ON (f.user_id = :uid AND f.friend_id = u.id)
+                        OR (f.friend_id = :uid AND f.user_id = u.id)
+                    WHERE u.id != :uid
+                      AND (
+                          LOWER(u.username)  LIKE LOWER(:q) OR
+                          LOWER(u.firstname) LIKE LOWER(:q) OR
+                          LOWER(u.lastname)  LIKE LOWER(:q)
+                      )
+                    ORDER BY u.firstname, u.lastname
+                    LIMIT 20
+                """), {"uid": current_uid, "q": f"%{f_search}%"}).fetchall()
+
+            if not search_results:
+                st.info("No users found matching that search.")
+            else:
+                for res in search_results:
+                    with st.container(border=True):
+                        rc1, rc2 = st.columns([4, 1])
+                        rc1.markdown(f"**{res.firstname} {res.lastname}** (@{res.username})")
+                        if res.likes:
+                            rc1.caption(f"Style: {res.likes}")
+
+                        if res.friendship_status == "friends":
+                            rc2.success("✅ Friends")
+                        elif res.friendship_status == "request_sent":
+                            rc2.info("⏳ Sent")
+                        elif res.friendship_status == "request_received":
+                            rc2.warning("📬 Accept?")
+                            if rc2.button("Accept", key=f"search_accept_{res.id}"):
+                                with engine.begin() as conn:
+                                    conn.execute(text("""
+                                        UPDATE friendships SET status='accepted'
+                                        WHERE user_id=:them AND friend_id=:me
+                                    """), {"them": res.id, "me": current_uid})
+                                st.rerun()
+                        else:
+                            if rc2.button("➕ Add", key=f"search_add_{res.id}"):
+                                try:
+                                    with engine.begin() as conn:
+                                        conn.execute(text("""
+                                            INSERT INTO friendships (user_id, friend_id, status)
+                                            VALUES (:u, :f, 'pending')
+                                        """), {"u": current_uid, "f": res.id})
+                                    st.toast(f"Friend request sent to {res.firstname}!")
+                                    st.rerun()
+                                except Exception:
+                                    st.warning("Request already exists.")
 
         st.divider()
         st.subheader("Your Adventure Crew")
