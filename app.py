@@ -451,7 +451,31 @@ else:
         pending_count = get_pending_count(current_uid)
         if pending_count > 0:
             st.warning(f"🔔 **{pending_count}** pending notification(s)")
-        if st.button("Log Out"):
+
+        st.divider()
+        with st.expander("✏️ Edit Profile"):
+            new_firstname = st.text_input("First Name", value=st.session_state.user_info.get("firstname", ""), key="profile_firstname")
+            new_lastname = st.text_input("Last Name", value=st.session_state.user_info.get("lastname", ""), key="profile_lastname")
+            new_email = st.text_input("Email", value=st.session_state.user_info.get("email", ""), key="profile_email")
+            new_likes = st.text_area("Travel Style / Interests", value=st.session_state.user_info.get("likes", ""), key="profile_likes", height=100)
+            if st.button("💾 Save Profile", use_container_width=True):
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text("""
+                            UPDATE users SET firstname=:fn, lastname=:ln, email=:em, likes=:lk
+                            WHERE id=:uid
+                        """), {"fn": new_firstname, "ln": new_lastname, "em": new_email, "lk": new_likes, "uid": current_uid})
+                    # Update session state so changes reflect immediately
+                    st.session_state.user_info["firstname"] = new_firstname
+                    st.session_state.user_info["lastname"] = new_lastname
+                    st.session_state.user_info["email"] = new_email
+                    st.session_state.user_info["likes"] = new_likes
+                    st.success("Profile updated!")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+        st.divider()
+        if st.button("Log Out", use_container_width=True):
             st.session_state.logged_in = False
             st.session_state.user_info = None
             st.rerun()
@@ -956,9 +980,8 @@ else:
                                 st.warning("Delete this trip permanently?")
                                 dy, dn = st.columns(2)
                                 if dy.button("Yes, delete", key=f"confirm_del_yes_{t.id}"):
-                                    with engine.connect() as conn2:
+                                    with engine.begin() as conn2:
                                         conn2.execute(text("DELETE FROM trips WHERE id = :tid"), {"tid": t.id})
-                                        conn2.commit()
                                     st.session_state[confirm_del_key] = False
                                     st.success("Trip deleted.")
                                     st.rerun()
