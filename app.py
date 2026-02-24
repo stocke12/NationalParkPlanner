@@ -26,10 +26,11 @@ for key, val in {
     "user_info": None,
     "temp_activities": [],
     "master_itinerary": "",
-    "day_activities": {},   # {day_number: [{"name":..., "type":..., "id":...}]}
+    "day_activities": {},
     "nights": 0,
-    "selected_parks": [],   # list of park names for multi-park trips
-    "activity_day_defaults": {},  # {activity_index: suggested_day_number}
+    "trip_start": None,
+    "trip_end": None,
+    "activity_day_defaults": {},
 }.items():
     if key not in st.session_state:
         st.session_state[key] = val
@@ -510,11 +511,10 @@ else:
         selected_parks = st.multiselect(
             "Parks",
             options=df_parks['name'].tolist(),
-            default=st.session_state.selected_parks or [],
             placeholder="Search and add parks...",
-            label_visibility="collapsed"
+            label_visibility="collapsed",
+            key="selected_parks"
         )
-        st.session_state.selected_parks = selected_parks
 
         if not selected_parks:
             st.info("Select at least one park to get started.")
@@ -544,6 +544,8 @@ else:
             else:
                 nights = (date_range[1] - date_range[0]).days
                 st.session_state.nights = nights
+                st.session_state.trip_start = date_range[0]
+                st.session_state.trip_end = date_range[1]
                 st.session_state.day_activities = {i + 1: [] for i in range(nights + 1)}
                 st.session_state.activity_day_defaults = {}
 
@@ -582,7 +584,7 @@ else:
                 Label each day clearly as "Day 1", "Day 2", etc. and list the specific activities under each day.
                 """
                 with st.spinner("Scouting the trail..."):
-                    resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text
+                    resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text
                     parts = resp.split('---MASTER_ITINERARY---')
                     st.session_state.temp_activities = [l for l in parts[0].strip().split('\n') if "|" in l]
                     st.session_state.master_itinerary = parts[1].strip() if len(parts) > 1 else ""
@@ -594,13 +596,24 @@ else:
                     for i, act in enumerate(st.session_state.temp_activities):
                         act_parts = act.split('|')
                         act_name = act_parts[0].strip()
-                        defaults[i] = guess_day_for_activity(act_name, day_map, default_day=1)
+                        suggested = guess_day_for_activity(act_name, day_map, default_day=1)
+                        defaults[i] = suggested
+                        # Force-reset the selectbox widget state so the new index takes effect
+                        widget_key = f"target_day_{i}"
+                        if widget_key in st.session_state:
+                            del st.session_state[widget_key]
                     st.session_state.activity_day_defaults = defaults
 
         # ── ACTIVITY PICKER + DAY-BY-DAY BOARD ──
-        if st.session_state.temp_activities and len(date_range) == 2 and selected_parks:
+        # Use session_state.selected_parks (set at generate time) so the panel
+        # doesn't disappear on rerun when the widget re-evaluates
+        active_parks = st.session_state.get("selected_parks") or selected_parks
+        # Use the stored trip dates (set at generate time) so board is stable on reruns
+        board_start = st.session_state.trip_start or (date_range[0] if len(date_range) == 2 else None)
+        board_end = st.session_state.trip_end or (date_range[1] if len(date_range) == 2 else None)
+        if st.session_state.temp_activities and board_start and board_end and active_parks:
             st.divider()
-            days = date_range_days(date_range[0], date_range[1])
+            days = date_range_days(board_start, board_end)
 
             left, right = st.columns([1, 2])
 
@@ -610,7 +623,7 @@ else:
 
                 # Show park images for all selected parks
                 with engine.connect() as conn:
-                    for park_name in selected_parks:
+                    for park_name in active_parks:
                         park_img = conn.execute(text("SELECT image_url FROM parks WHERE name = :n"), {"n": park_name}).scalar()
                         if park_img:
                             st.image(park_img, caption=park_name, use_container_width=True)
@@ -660,12 +673,12 @@ else:
                 st.markdown(st.session_state.master_itinerary)
 
                 if st.button("💾 Save Trip"):
-                    if not selected_parks:
+                    if not active_parks:
                         st.error("No parks selected.")
                     else:
                         try:
-                            parks_label = ", ".join(selected_parks)
-                            trip_name = f"{parks_label} Trip" if len(selected_parks) == 1 else f"Multi-Park Trip: {parks_label}"
+                            parks_label = ", ".join(active_parks)
+                            trip_name = f"{parks_label} Trip" if len(active_parks) == 1 else f"Multi-Park Trip: {parks_label}"
 
                             with engine.begin() as conn:
                                 tid_res = conn.execute(text("""
@@ -688,12 +701,12 @@ else:
                                         """), {"t": tid, "u": fid, "role": f_role, "inviter": current_uid})
 
                                 # ── Insert ALL selected parks into trip_parks ──
-                                for park_name in selected_parks:
+                                for park_name in active_parks:
                                     park_row = df_parks[df_parks['name'] == park_name]
                                     if not park_row.empty:
                                         p_id = int(park_row['id'].iloc[0])
                                         # Attach master itinerary notes only to first park to avoid duplication
-                                        notes_text = f"MASTER ITINERARY:\n{st.session_state.master_itinerary}" if park_name == selected_parks[0] else ""
+                                        notes_text = f"MASTER ITINERARY:\n{st.session_state.master_itinerary}" if park_name == active_parks[0] else ""
                                         conn.execute(text("""
                                             INSERT INTO trip_parks (trip_id, park_id, notes)
                                             VALUES (:t, :p, :n)
@@ -711,8 +724,12 @@ else:
                             st.balloons()
                             st.session_state.day_activities = {}
                             st.session_state.temp_activities = []
-                            st.session_state.selected_parks = []
                             st.session_state.activity_day_defaults = {}
+                            st.session_state.trip_start = None
+                            st.session_state.trip_end = None
+                            # Clear the parks multiselect widget state
+                            if "selected_parks" in st.session_state:
+                                del st.session_state["selected_parks"]
 
                         except Exception as e:
                             st.error(f"Database Error: {e}")
