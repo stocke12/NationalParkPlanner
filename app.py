@@ -29,6 +29,7 @@ for key, val in {
     "day_activities": {},   # {day_number: [{"name":..., "type":..., "id":...}]}
     "nights": 0,
     "selected_parks": [],   # list of park names for multi-park trips
+    "activity_day_defaults": {},  # {activity_index: suggested_day_number}
 }.items():
     if key not in st.session_state:
         st.session_state[key] = val
@@ -108,6 +109,52 @@ def get_trip_parks(conn, trip_id):
         WHERE tpk.trip_id = :tid
         ORDER BY p.name
     """), {"tid": trip_id}).fetchall()
+
+def parse_activity_day_defaults(master_itinerary, num_days):
+    """
+    Parse the master itinerary text to extract which day each activity belongs to.
+    Returns a dict mapping activity name (lowercased) -> day_number.
+    """
+    day_map = {}
+    if not master_itinerary:
+        return day_map
+
+    current_day = 1
+    for line in master_itinerary.split('\n'):
+        line_stripped = line.strip()
+        # Detect day headers like "Day 1", "Day 2:", "**Day 3**", etc.
+        import re
+        day_match = re.search(r'\bday\s*(\d+)\b', line_stripped, re.IGNORECASE)
+        if day_match:
+            detected_day = int(day_match.group(1))
+            if 1 <= detected_day <= num_days:
+                current_day = detected_day
+        # Store activity text fragments with their day
+        if line_stripped and not day_match:
+            day_map[line_stripped.lower()] = current_day
+
+    return day_map
+
+def guess_day_for_activity(activity_name, day_map, default_day=1):
+    """
+    Try to find the best matching day for an activity name using the parsed itinerary map.
+    """
+    name_lower = activity_name.lower()
+    # Direct substring match
+    for line_text, day_num in day_map.items():
+        if name_lower in line_text or line_text in name_lower:
+            return day_num
+    # Word overlap match
+    name_words = set(name_lower.split())
+    best_overlap = 0
+    best_day = default_day
+    for line_text, day_num in day_map.items():
+        line_words = set(line_text.split())
+        overlap = len(name_words & line_words)
+        if overlap > best_overlap and overlap >= 2:
+            best_overlap = overlap
+            best_day = day_num
+    return best_day
 
 # ─────────────────────────────────────────────
 # DRAG-AND-DROP ITINERARY COMPONENT
@@ -498,6 +545,7 @@ else:
                 nights = (date_range[1] - date_range[0]).days
                 st.session_state.nights = nights
                 st.session_state.day_activities = {i + 1: [] for i in range(nights + 1)}
+                st.session_state.activity_day_defaults = {}
 
                 parks_label = ", ".join(selected_parks)
 
@@ -531,12 +579,23 @@ else:
                 ---MASTER_ITINERARY---
                 Provide a full day-by-day itinerary for {itinerary_context}.
                 {group_note}
+                Label each day clearly as "Day 1", "Day 2", etc. and list the specific activities under each day.
                 """
                 with st.spinner("Scouting the trail..."):
                     resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text
                     parts = resp.split('---MASTER_ITINERARY---')
                     st.session_state.temp_activities = [l for l in parts[0].strip().split('\n') if "|" in l]
                     st.session_state.master_itinerary = parts[1].strip() if len(parts) > 1 else ""
+
+                    # Parse the master itinerary to build day defaults for each activity
+                    num_days = nights + 1
+                    day_map = parse_activity_day_defaults(st.session_state.master_itinerary, num_days)
+                    defaults = {}
+                    for i, act in enumerate(st.session_state.temp_activities):
+                        act_parts = act.split('|')
+                        act_name = act_parts[0].strip()
+                        defaults[i] = guess_day_for_activity(act_name, day_map, default_day=1)
+                    st.session_state.activity_day_defaults = defaults
 
         # ── ACTIVITY PICKER + DAY-BY-DAY BOARD ──
         if st.session_state.temp_activities and len(date_range) == 2 and selected_parks:
@@ -560,16 +619,24 @@ else:
                     parts = act.split('|')
                     name = parts[0].strip()
                     a_type = parts[1].strip() if len(parts) > 1 else "Activity"
-                    # Park column is now the 3rd element (index 2) if present
                     a_park = parts[2].strip() if len(parts) > 2 else ""
+
+                    # Use the suggested day from the master itinerary as the default
+                    suggested_day = st.session_state.activity_day_defaults.get(i, 1)
+                    day_options = [d[0] for d in days]
+                    # Clamp suggested_day to valid range
+                    if suggested_day not in day_options:
+                        suggested_day = day_options[0] if day_options else 1
+                    default_index = day_options.index(suggested_day) if suggested_day in day_options else 0
 
                     with st.container(border=True):
                         ac1, ac2, ac3 = st.columns([2, 2, 1])
                         ac1.markdown(f"**{name}**")
                         ac1.caption(f"{a_type}" + (f" · {a_park}" if a_park else ""))
                         target_day = ac2.selectbox(
-                            "Day", options=[d[0] for d in days],
+                            "Day", options=day_options,
                             format_func=lambda d: f"Day {d}",
+                            index=default_index,
                             key=f"target_day_{i}"
                         )
                         if ac3.button("➕", key=f"add_{i}"):
@@ -587,30 +654,6 @@ else:
                 st.caption("Drag activities between days • Click ✕ to remove")
 
                 render_dnd_itinerary(st.session_state.day_activities, days, editable=True)
-
-                # Manual move fallback
-                st.divider()
-                st.markdown("**Move an activity between days:**")
-                all_placed = []
-                for day_num, acts in st.session_state.day_activities.items():
-                    for act in acts:
-                        all_placed.append((day_num, act))
-
-                if all_placed:
-                    mv1, mv2, mv3 = st.columns([3, 2, 1])
-                    act_labels = [f"Day {d} — {a['name']}" for d, a in all_placed]
-                    selected_act = mv1.selectbox("Activity", act_labels, key="move_act_sel")
-                    move_to_day = mv2.selectbox("Move to Day", [d[0] for d in days], key="move_to_day")
-                    if mv3.button("Move"):
-                        idx = act_labels.index(selected_act)
-                        src_day, act_to_move = all_placed[idx]
-                        st.session_state.day_activities[src_day] = [
-                            a for a in st.session_state.day_activities[src_day] if a["id"] != act_to_move["id"]
-                        ]
-                        if move_to_day not in st.session_state.day_activities:
-                            st.session_state.day_activities[move_to_day] = []
-                        st.session_state.day_activities[move_to_day].append(act_to_move)
-                        st.rerun()
 
                 st.divider()
                 st.subheader("📖 AI Master Itinerary")
@@ -669,6 +712,7 @@ else:
                             st.session_state.day_activities = {}
                             st.session_state.temp_activities = []
                             st.session_state.selected_parks = []
+                            st.session_state.activity_day_defaults = {}
 
                         except Exception as e:
                             st.error(f"Database Error: {e}")
