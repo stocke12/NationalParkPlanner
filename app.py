@@ -582,7 +582,7 @@ else:
                 Label each day clearly as "Day 1", "Day 2", etc. and list the specific activities under each day.
                 """
                 with st.spinner("Scouting the trail..."):
-                    resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text
+                    resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text
                     parts = resp.split('---MASTER_ITINERARY---')
                     st.session_state.temp_activities = [l for l in parts[0].strip().split('\n') if "|" in l]
                     st.session_state.master_itinerary = parts[1].strip() if len(parts) > 1 else ""
