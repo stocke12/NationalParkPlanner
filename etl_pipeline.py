@@ -51,6 +51,88 @@ def setup_database(engine):
                 likes TEXT
             );
         """))
+
+        # Create Trips Table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS trips (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id),
+                owner_id INTEGER REFERENCES users(id),
+                trip_name TEXT,
+                start_date DATE,
+                end_date DATE
+            );
+        """))
+
+        # Create Trip Participants Table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS trip_participants (
+                id SERIAL PRIMARY KEY,
+                trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id),
+                role TEXT DEFAULT 'viewer',
+                invitation_status TEXT DEFAULT 'pending',
+                invited_by INTEGER REFERENCES users(id),
+                responded_at TIMESTAMP
+            );
+        """))
+
+        # Create Trip Parks Table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS trip_parks (
+                id SERIAL PRIMARY KEY,
+                trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
+                park_id INTEGER REFERENCES parks(id),
+                notes TEXT
+            );
+        """))
+
+        # Create Trip Activities Table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS trip_activities (
+                id SERIAL PRIMARY KEY,
+                trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
+                day_number INTEGER,
+                activity_name TEXT,
+                activity_type TEXT,
+                sort_order INTEGER DEFAULT 0
+            );
+        """))
+
+        # Create Friendships Table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS friendships (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id),
+                friend_id INTEGER REFERENCES users(id),
+                status TEXT DEFAULT 'pending'
+            );
+        """))
+
+        # Create Packing List Table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS trip_packing_items (
+                id SERIAL PRIMARY KEY,
+                trip_id INTEGER NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+                category VARCHAR(100),
+                item_name VARCHAR(255) NOT NULL,
+                is_checked BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """))
+
+        # Create Trip Day Notes / Journal Table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS trip_day_notes (
+                id SERIAL PRIMARY KEY,
+                trip_id INTEGER NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+                day_number INTEGER NOT NULL,
+                author_id INTEGER REFERENCES users(id),
+                note_text TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """))
+
         conn.commit()
     print("Database check complete.")
 
