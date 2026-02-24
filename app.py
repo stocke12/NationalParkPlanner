@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import re
 import json
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -31,6 +32,8 @@ for key, val in {
     "trip_start": None,
     "trip_end": None,
     "activity_day_defaults": {},
+    "park_distances": [],       # list of dicts from distance check
+    "conflict_warnings": {},    # {day_num: [warning strings]}
 }.items():
     if key not in st.session_state:
         st.session_state[key] = val
@@ -87,7 +90,6 @@ def can_edit(role):
     return role in ('owner', 'collaborator')
 
 def date_range_days(start, end):
-    """Returns list of (day_number, date) tuples for a trip."""
     if not start or not end:
         return []
     days = []
@@ -101,7 +103,6 @@ def date_range_days(start, end):
     return days
 
 def get_trip_parks(conn, trip_id):
-    """Returns list of (trip_park_id, park_id, park_name, notes) for a trip."""
     return conn.execute(text("""
         SELECT tpk.id AS trip_park_id, tpk.park_id, p.name AS park_name,
                p.image_url, tpk.notes
@@ -112,40 +113,26 @@ def get_trip_parks(conn, trip_id):
     """), {"tid": trip_id}).fetchall()
 
 def parse_activity_day_defaults(master_itinerary, num_days):
-    """
-    Parse the master itinerary text to extract which day each activity belongs to.
-    Returns a dict mapping activity name (lowercased) -> day_number.
-    """
     day_map = {}
     if not master_itinerary:
         return day_map
-
     current_day = 1
     for line in master_itinerary.split('\n'):
         line_stripped = line.strip()
-        # Detect day headers like "Day 1", "Day 2:", "**Day 3**", etc.
-        import re
         day_match = re.search(r'\bday\s*(\d+)\b', line_stripped, re.IGNORECASE)
         if day_match:
             detected_day = int(day_match.group(1))
             if 1 <= detected_day <= num_days:
                 current_day = detected_day
-        # Store activity text fragments with their day
         if line_stripped and not day_match:
             day_map[line_stripped.lower()] = current_day
-
     return day_map
 
 def guess_day_for_activity(activity_name, day_map, default_day=1):
-    """
-    Try to find the best matching day for an activity name using the parsed itinerary map.
-    """
     name_lower = activity_name.lower()
-    # Direct substring match
     for line_text, day_num in day_map.items():
         if name_lower in line_text or line_text in name_lower:
             return day_num
-    # Word overlap match
     name_words = set(name_lower.split())
     best_overlap = 0
     best_day = default_day
@@ -158,24 +145,125 @@ def guess_day_for_activity(activity_name, day_map, default_day=1):
     return best_day
 
 # ─────────────────────────────────────────────
+# CONFLICT DETECTION
+# ─────────────────────────────────────────────
+
+STRENUOUS_KEYWORDS = {"hike", "hiking", "climb", "climbing", "backpack", "backpacking",
+                      "trail", "summit", "scramble", "trek", "trekking", "rafting", "kayak"}
+NIGHT_KEYWORDS = {"stargazing", "night", "sunset", "campfire", "evening", "dusk", "bonfire"}
+EARLY_KEYWORDS = {"sunrise", "dawn", "morning", "early", "ranger walk"}
+WATER_KEYWORDS = {"swim", "swimming", "snorkel", "diving", "kayak", "rafting", "canoe"}
+
+def classify_activity(name, atype):
+    text_lower = (name + " " + atype).lower()
+    tags = set()
+    if any(k in text_lower for k in STRENUOUS_KEYWORDS):
+        tags.add("strenuous")
+    if any(k in text_lower for k in NIGHT_KEYWORDS):
+        tags.add("night")
+    if any(k in text_lower for k in EARLY_KEYWORDS):
+        tags.add("early")
+    if any(k in text_lower for k in WATER_KEYWORDS):
+        tags.add("water")
+    return tags
+
+def compute_conflict_warnings(day_activities):
+    """Returns {day_num: [warning_strings]} for days with scheduling issues."""
+    warnings = {}
+    for day_num, acts in day_activities.items():
+        day_warnings = []
+        strenuous = [a for a in acts if "strenuous" in classify_activity(a["name"], a.get("type", ""))]
+        night_acts = [a for a in acts if "night" in classify_activity(a["name"], a.get("type", ""))]
+        early_acts = [a for a in acts if "early" in classify_activity(a["name"], a.get("type", ""))]
+
+        if len(strenuous) >= 3:
+            names = ", ".join(a["name"] for a in strenuous)
+            day_warnings.append(f"🥵 **Heavy day!** 3+ strenuous activities: {names}")
+        elif len(strenuous) == 2:
+            names = " & ".join(a["name"] for a in strenuous)
+            day_warnings.append(f"⚠️ **Back-to-back effort:** {names} — consider spacing these out")
+
+        if night_acts and early_acts:
+            n = night_acts[0]["name"]
+            e = early_acts[0]["name"]
+            day_warnings.append(f"😴 **Sleep conflict:** '{e}' (early start) and '{n}' (late night) on the same day")
+
+        if day_warnings:
+            warnings[day_num] = day_warnings
+    return warnings
+
+# ─────────────────────────────────────────────
+# PARK DISTANCE HELPER (AI-powered)
+# ─────────────────────────────────────────────
+
+def fetch_park_distances(park_names):
+    """
+    Ask Gemini for estimated drive times between consecutive parks.
+    Returns list of dicts: {from, to, drive_time, distance_miles, tip}
+    """
+    if len(park_names) < 2:
+        return []
+    pairs = [(park_names[i], park_names[i+1]) for i in range(len(park_names)-1)]
+    pair_text = "\n".join(f"- {a} to {b}" for a, b in pairs)
+    prompt = f"""For each pair of US National Parks below, provide the approximate driving distance and time.
+Respond ONLY as a JSON array, no markdown, no extra text. Each element:
+{{"from": "...", "to": "...", "drive_time": "e.g. 3h 20min", "distance_miles": 210, "tip": "one short travel tip"}}
+
+Pairs:
+{pair_text}"""
+    try:
+        resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text
+        clean = re.sub(r"```json|```", "", resp).strip()
+        return json.loads(clean)
+    except Exception:
+        return []
+
+# ─────────────────────────────────────────────
+# PACKING LIST GENERATOR (AI-powered)
+# ─────────────────────────────────────────────
+
+def generate_packing_list(park_names, activity_types, num_days):
+    """Ask Gemini for a categorized packing list. Returns list of {category, item}."""
+    parks_str = ", ".join(park_names)
+    acts_str = ", ".join(set(activity_types)) if activity_types else "general sightseeing"
+    prompt = f"""Generate a practical packing list for a {num_days}-day trip to {parks_str}.
+Activities include: {acts_str}.
+Respond ONLY as a JSON array, no markdown, no extra text. Each element:
+{{"category": "e.g. Clothing", "item": "e.g. Moisture-wicking shirt x3"}}
+Include 25-35 items across categories like: Clothing, Footwear, Navigation, Safety, Camping/Shelter, Food & Water, Photography, Personal Care, Documents."""
+    try:
+        resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text
+        clean = re.sub(r"```json|```", "", resp).strip()
+        return json.loads(clean)
+    except Exception:
+        return []
+
+# ─────────────────────────────────────────────
 # DRAG-AND-DROP ITINERARY COMPONENT
 # ─────────────────────────────────────────────
 
-def render_dnd_itinerary(day_activities, days, editable=True):
-    """
-    Renders a drag-and-drop day-by-day itinerary using a custom HTML component.
-    """
+def render_dnd_itinerary(day_activities, days, editable=True, conflict_warnings=None):
+    if conflict_warnings is None:
+        conflict_warnings = {}
     days_data = []
     for day_num, day_date in days:
         acts = day_activities.get(day_num, [])
+        cw = conflict_warnings.get(day_num, [])
         days_data.append({
             "day": day_num,
             "label": f"Day {day_num} — {day_date.strftime('%a, %b %d')}",
-            "activities": [{"id": a["id"], "name": a["name"], "type": a.get("type", "Activity")} for a in acts]
+            "activities": [{"id": a["id"], "name": a["name"], "type": a.get("type", "Activity")} for a in acts],
+            "warnings": cw,
         })
 
     delete_btn = '<button class="delete-btn" onclick="deleteActivity(this)" title="Remove">✕</button>' if editable else ""
     draggable_attr = "draggable='true' ondragstart='handleDragStart(event, this)'" if editable else ""
+
+    def warning_html(warnings):
+        if not warnings:
+            return ""
+        items = "".join(f'<div class="warn-item">{w}</div>' for w in warnings)
+        return f'<div class="day-warnings">{items}</div>'
 
     html = f"""
     <style>
@@ -193,6 +281,7 @@ def render_dnd_itinerary(day_activities, days, editable=True):
             padding: 10px;
             min-height: 120px;
         }}
+        .day-col.has-warning {{ background: #fff8e1; border: 1px solid #ffe082; }}
         .day-header {{
             font-size: 0.8em;
             font-weight: 700;
@@ -202,6 +291,19 @@ def render_dnd_itinerary(day_activities, days, editable=True):
             border-bottom: 2px solid #2d6a4f;
             text-transform: uppercase;
             letter-spacing: 0.5px;
+        }}
+        .day-warnings {{
+            margin-bottom: 8px;
+        }}
+        .warn-item {{
+            font-size: 0.75em;
+            color: #7b5800;
+            background: #fff3cd;
+            border-left: 3px solid #ffc107;
+            border-radius: 4px;
+            padding: 4px 7px;
+            margin-bottom: 4px;
+            line-height: 1.3;
         }}
         .activity-card {{
             background: white;
@@ -217,51 +319,33 @@ def render_dnd_itinerary(day_activities, days, editable=True):
             border-left: 3px solid #52b788;
             transition: box-shadow 0.15s;
         }}
-        .activity-card.dragging {{
-            opacity: 0.5;
-            cursor: grabbing;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-        }}
-        .activity-card:hover {{
-            box-shadow: 0 3px 8px rgba(0,0,0,0.15);
-        }}
+        .activity-card.dragging {{ opacity: 0.5; cursor: grabbing; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }}
+        .activity-card:hover {{ box-shadow: 0 3px 8px rgba(0,0,0,0.15); }}
         .act-name {{ font-weight: 600; color: #1b4332; }}
         .act-type {{ color: #888; font-size: 0.85em; margin-top: 2px; }}
         .delete-btn {{
-            background: none;
-            border: none;
-            color: #ccc;
-            cursor: pointer;
-            font-size: 1em;
-            padding: 0 2px;
-            line-height: 1;
+            background: none; border: none; color: #ccc; cursor: pointer;
+            font-size: 1em; padding: 0 2px; line-height: 1;
         }}
         .delete-btn:hover {{ color: #e74c3c; }}
         .drop-zone {{
-            min-height: 40px;
-            border-radius: 6px;
+            min-height: 40px; border-radius: 6px;
             border: 2px dashed transparent;
-            transition: border-color 0.2s, background 0.2s;
-            margin-top: 4px;
+            transition: border-color 0.2s, background 0.2s; margin-top: 4px;
         }}
-        .drop-zone.drag-over {{
-            border-color: #52b788;
-            background: #d8f3dc;
-        }}
+        .drop-zone.drag-over {{ border-color: #52b788; background: #d8f3dc; }}
         #result {{ display: none; }}
     </style>
-
     <div class="itinerary-grid" id="itinerary">
         {"".join(f'''
-        <div class="day-col" id="day-{d["day"]}"
+        <div class="day-col{"" if not d["warnings"] else " has-warning"}" id="day-{d["day"]}"
              ondragover="event.preventDefault(); this.querySelector('.drop-zone').classList.add('drag-over')"
              ondragleave="this.querySelector('.drop-zone').classList.remove('drag-over')"
              ondrop="handleDrop(event, {d['day']})">
             <div class="day-header">{d["label"]}</div>
+            {warning_html(d["warnings"])}
             {"".join(f'''
-            <div class="activity-card"
-                 {draggable_attr}
-                 data-id="{a["id"]}" data-day="{d["day"]}">
+            <div class="activity-card" {draggable_attr} data-id="{a["id"]}" data-day="{d["day"]}">
                 <div>
                     <div class="act-name">{a["name"]}</div>
                     <div class="act-type">{a["type"]}</div>
@@ -274,21 +358,16 @@ def render_dnd_itinerary(day_activities, days, editable=True):
         ''' for d in days_data)}
     </div>
     <textarea id="result"></textarea>
-
     <script>
         let dragSrc = null;
-
         function handleDragStart(e, el) {{
-            dragSrc = el;
-            el.classList.add('dragging');
+            dragSrc = el; el.classList.add('dragging');
             e.dataTransfer.effectAllowed = 'move';
         }}
-
         document.addEventListener('dragend', () => {{
             document.querySelectorAll('.activity-card').forEach(c => c.classList.remove('dragging'));
             document.querySelectorAll('.drop-zone').forEach(z => z.classList.remove('drag-over'));
         }});
-
         function handleDrop(e, newDay) {{
             e.preventDefault();
             if (!dragSrc) return;
@@ -300,12 +379,10 @@ def render_dnd_itinerary(day_activities, days, editable=True):
             dragSrc = null;
             saveState();
         }}
-
         function deleteActivity(btn) {{
             btn.closest('.activity-card').remove();
             saveState();
         }}
-
         function saveState() {{
             const state = {{}};
             document.querySelectorAll('.day-col').forEach(col => {{
@@ -322,7 +399,6 @@ def render_dnd_itinerary(day_activities, days, editable=True):
         }}
     </script>
     """
-
     result = st.components.v1.html(html, height=max(300, len(days) * 60 + 100), scrolling=False)
     return result
 
@@ -426,11 +502,9 @@ else:
                     fc1, fc2 = st.columns([4, 1])
                     fc1.write(f"**{f.firstname}** (@{f.username})")
                     fc1.caption(f"Style: {f.likes}")
-
                     confirm_key = f"confirm_del_friend_{f.friendship_id}"
                     if confirm_key not in st.session_state:
                         st.session_state[confirm_key] = False
-
                     if not st.session_state[confirm_key]:
                         if fc2.button("🗑️", key=f"del_friend_btn_{f.friendship_id}", help="Remove friend"):
                             st.session_state[confirm_key] = True
@@ -506,7 +580,6 @@ else:
             friend_options = {fr[1]: fr[0] for fr in friends_res}
             df_parks = pd.read_sql(text("SELECT name, id FROM parks ORDER BY name"), conn)
 
-        # ── MULTI-PARK SELECTOR ──
         st.markdown("**Select Parks** _(choose one or more)_")
         selected_parks = st.multiselect(
             "Parks",
@@ -521,7 +594,6 @@ else:
 
         date_range = st.date_input("Dates", value=(date.today(), date.today()))
 
-        # Validate date range
         if len(date_range) == 2 and date_range[1] < date_range[0]:
             st.error("End date must be on or after start date.")
             date_range = (date_range[0], date_range[0])
@@ -548,10 +620,10 @@ else:
                 st.session_state.trip_end = date_range[1]
                 st.session_state.day_activities = {i + 1: [] for i in range(nights + 1)}
                 st.session_state.activity_day_defaults = {}
+                st.session_state.park_distances = []
+                st.session_state.conflict_warnings = {}
 
                 parks_label = ", ".join(selected_parks)
-
-                # Build group travel styles for the prompt
                 travel_styles = [f"{st.session_state.user_info['firstname']}: {st.session_state.user_info['likes']}"]
                 if invite_roles:
                     with engine.connect() as conn:
@@ -589,7 +661,6 @@ else:
                     st.session_state.temp_activities = [l for l in parts[0].strip().split('\n') if "|" in l]
                     st.session_state.master_itinerary = parts[1].strip() if len(parts) > 1 else ""
 
-                    # Parse the master itinerary to build day defaults for each activity
                     num_days = nights + 1
                     day_map = parse_activity_day_defaults(st.session_state.master_itinerary, num_days)
                     defaults = {}
@@ -598,48 +669,92 @@ else:
                         act_name = act_parts[0].strip()
                         suggested = guess_day_for_activity(act_name, day_map, default_day=1)
                         defaults[i] = suggested
-                        # Force-reset the selectbox widget state so the new index takes effect
                         widget_key = f"target_day_{i}"
                         if widget_key in st.session_state:
                             del st.session_state[widget_key]
                     st.session_state.activity_day_defaults = defaults
 
+                # Fetch park distances for multi-park trips (outside spinner so it shows separately)
+                if len(selected_parks) > 1:
+                    with st.spinner("Calculating park distances..."):
+                        st.session_state.park_distances = fetch_park_distances(selected_parks)
+
+        # ── PARK DISTANCE BANNER ──
+        if st.session_state.park_distances:
+            st.divider()
+            st.subheader("🚗 Park-to-Park Drive Times")
+            dist_cols = st.columns(len(st.session_state.park_distances))
+            for idx, leg in enumerate(st.session_state.park_distances):
+                with dist_cols[idx]:
+                    with st.container(border=True):
+                        st.markdown(f"**{leg.get('from','?')} → {leg.get('to','?')}**")
+                        st.metric("Drive Time", leg.get("drive_time", "—"))
+                        st.caption(f"~{leg.get('distance_miles','?')} miles")
+                        if leg.get("tip"):
+                            st.caption(f"💡 {leg['tip']}")
+
         # ── ACTIVITY PICKER + DAY-BY-DAY BOARD ──
-        # Use session_state.selected_parks (set at generate time) so the panel
-        # doesn't disappear on rerun when the widget re-evaluates
         active_parks = st.session_state.get("selected_parks") or selected_parks
-        # Use the stored trip dates (set at generate time) so board is stable on reruns
         board_start = st.session_state.trip_start or (date_range[0] if len(date_range) == 2 else None)
         board_end = st.session_state.trip_end or (date_range[1] if len(date_range) == 2 else None)
+
         if st.session_state.temp_activities and board_start and board_end and active_parks:
             st.divider()
             days = date_range_days(board_start, board_end)
+
+            # Recompute conflict warnings whenever we render
+            st.session_state.conflict_warnings = compute_conflict_warnings(st.session_state.day_activities)
 
             left, right = st.columns([1, 2])
 
             with left:
                 st.subheader("💡 Suggested Activities")
-                st.caption("Check activities to add them to a day")
 
-                # Show park images for all selected parks
                 with engine.connect() as conn:
                     for park_name in active_parks:
                         park_img = conn.execute(text("SELECT image_url FROM parks WHERE name = :n"), {"n": park_name}).scalar()
                         if park_img:
                             st.image(park_img, caption=park_name, use_container_width=True)
 
+                day_options = [d[0] for d in days]
+
+                sorted_activities = []
                 for i, act in enumerate(st.session_state.temp_activities):
                     parts = act.split('|')
                     name = parts[0].strip()
                     a_type = parts[1].strip() if len(parts) > 1 else "Activity"
                     a_park = parts[2].strip() if len(parts) > 2 else ""
-
-                    # Use the suggested day from the master itinerary as the default
                     suggested_day = st.session_state.activity_day_defaults.get(i, 1)
-                    day_options = [d[0] for d in days]
-                    # Clamp suggested_day to valid range
                     if suggested_day not in day_options:
                         suggested_day = day_options[0] if day_options else 1
+                    sorted_activities.append((i, name, a_type, a_park, suggested_day))
+                sorted_activities.sort(key=lambda x: x[4])
+
+                if st.button("✅ Apply All to Trip", use_container_width=True):
+                    added = 0
+                    for i, name, a_type, a_park, suggested_day in sorted_activities:
+                        target = st.session_state.get(f"target_day_{i}", suggested_day)
+                        if target not in st.session_state.day_activities:
+                            st.session_state.day_activities[target] = []
+                        existing_names = [a["name"] for a in st.session_state.day_activities[target]]
+                        if name not in existing_names:
+                            st.session_state.day_activities[target].append(
+                                {"id": f"act_{i}_{target}", "name": name, "type": a_type}
+                            )
+                            added += 1
+                    st.toast(f"Added {added} activities to your itinerary! 🎒")
+                    st.rerun()
+
+                st.caption("Or add individually:")
+
+                current_day_label = None
+                for i, name, a_type, a_park, suggested_day in sorted_activities:
+                    if suggested_day != current_day_label:
+                        current_day_label = suggested_day
+                        day_date = next((d[1] for d in days if d[0] == suggested_day), None)
+                        day_label = f"Day {suggested_day}" + (f" — {day_date.strftime('%a, %b %d')}" if day_date else "")
+                        st.markdown(f"**📅 {day_label}**")
+
                     default_index = day_options.index(suggested_day) if suggested_day in day_options else 0
 
                     with st.container(border=True):
@@ -666,7 +781,21 @@ else:
                 st.subheader("📅 Day-by-Day Itinerary")
                 st.caption("Drag activities between days • Click ✕ to remove")
 
-                render_dnd_itinerary(st.session_state.day_activities, days, editable=True)
+                # Show any conflict warnings above the board as a summary
+                if st.session_state.conflict_warnings:
+                    total = sum(len(v) for v in st.session_state.conflict_warnings.values())
+                    with st.expander(f"⚠️ {total} scheduling conflict(s) detected — click to review", expanded=False):
+                        for day_num, warns in sorted(st.session_state.conflict_warnings.items()):
+                            st.markdown(f"**Day {day_num}**")
+                            for w in warns:
+                                st.markdown(f"&nbsp;&nbsp;{w}")
+
+                render_dnd_itinerary(
+                    st.session_state.day_activities,
+                    days,
+                    editable=True,
+                    conflict_warnings=st.session_state.conflict_warnings
+                )
 
                 st.divider()
                 st.subheader("📖 AI Master Itinerary")
@@ -684,7 +813,7 @@ else:
                                 tid_res = conn.execute(text("""
                                     INSERT INTO trips (user_id, owner_id, trip_name, start_date, end_date)
                                     VALUES (:u, :u, :n, :s, :e) RETURNING id
-                                """), {"u": current_uid, "n": trip_name, "s": date_range[0], "e": date_range[1]}).fetchone()
+                                """), {"u": current_uid, "n": trip_name, "s": board_start, "e": board_end}).fetchone()
                                 tid = tid_res[0]
 
                                 conn.execute(text("""
@@ -700,25 +829,35 @@ else:
                                             VALUES (:t, :u, :role, 'pending', :inviter)
                                         """), {"t": tid, "u": fid, "role": f_role, "inviter": current_uid})
 
-                                # ── Insert ALL selected parks into trip_parks ──
                                 for park_name in active_parks:
                                     park_row = df_parks[df_parks['name'] == park_name]
                                     if not park_row.empty:
                                         p_id = int(park_row['id'].iloc[0])
-                                        # Attach master itinerary notes only to first park to avoid duplication
                                         notes_text = f"MASTER ITINERARY:\n{st.session_state.master_itinerary}" if park_name == active_parks[0] else ""
                                         conn.execute(text("""
                                             INSERT INTO trip_parks (trip_id, park_id, notes)
                                             VALUES (:t, :p, :n)
                                         """), {"t": tid, "p": p_id, "n": notes_text})
 
-                                # Save day-by-day activities
                                 for day_num, activities in st.session_state.day_activities.items():
                                     for order, act in enumerate(activities):
                                         conn.execute(text("""
                                             INSERT INTO trip_activities (trip_id, day_number, activity_name, activity_type, sort_order)
                                             VALUES (:tid, :day, :name, :atype, :order)
                                         """), {"tid": tid, "day": day_num, "name": act["name"], "atype": act.get("type", ""), "order": order})
+
+                            # Generate & save packing list
+                            all_types = [act.get("type", "") for acts in st.session_state.day_activities.values() for act in acts]
+                            num_days = (board_end - board_start).days + 1
+                            with st.spinner("Packing your bags..."):
+                                packing_items = generate_packing_list(active_parks, all_types, num_days)
+                            if packing_items:
+                                with engine.begin() as conn:
+                                    for item in packing_items:
+                                        conn.execute(text("""
+                                            INSERT INTO trip_packing_items (trip_id, category, item_name)
+                                            VALUES (:tid, :cat, :item)
+                                        """), {"tid": tid, "cat": item.get("category", "General"), "item": item.get("item", "")})
 
                             st.success("Adventure locked in! 🎉")
                             st.balloons()
@@ -727,7 +866,8 @@ else:
                             st.session_state.activity_day_defaults = {}
                             st.session_state.trip_start = None
                             st.session_state.trip_end = None
-                            # Clear the parks multiselect widget state
+                            st.session_state.park_distances = []
+                            st.session_state.conflict_warnings = {}
                             if "selected_parks" in st.session_state:
                                 del st.session_state["selected_parks"]
 
@@ -741,7 +881,6 @@ else:
         st.header("Your Adventures")
 
         with engine.connect() as conn:
-            # Aggregate park names with STRING_AGG to avoid duplicate trip rows
             trips = conn.execute(text("""
                 SELECT DISTINCT t.id, t.trip_name, t.start_date, t.end_date,
                        STRING_AGG(DISTINCT p.name, ', ' ORDER BY p.name) AS park_names,
@@ -768,7 +907,6 @@ else:
                 editable = can_edit(t.role)
 
                 with st.expander(label):
-                    # Show images for all parks in the trip
                     if t.park_images:
                         imgs = [img for img in t.park_images.split('|') if img]
                         if imgs:
@@ -797,7 +935,6 @@ else:
                                 st.session_state[edit_key] = not st.session_state[edit_key]
                                 st.rerun()
 
-                        # Build combined notes for PDF from all parks
                         with engine.connect() as conn_pdf:
                             trip_parks_rows = get_trip_parks(conn_pdf, t.id)
                         all_notes = "\n\n".join(
@@ -807,7 +944,6 @@ else:
                             pdf_b = create_pdf(all_notes, t.trip_name, st.session_state.user_info['firstname'])
                             st.download_button("📥 PDF", pdf_b, f"Trip_{t.id}.pdf", key=f"dl_{t.id}")
 
-                        # Delete trip (owner only)
                         if t.role == "owner":
                             if not st.session_state[confirm_del_key]:
                                 if st.button("🗑️ Delete", key=f"del_trip_btn_{t.id}"):
@@ -837,7 +973,6 @@ else:
                         end = t.end_date if isinstance(t.end_date, date) else (date.fromisoformat(str(t.end_date)) if t.end_date else date.today())
                         new_dates = st.date_input("Dates", value=(start, end), key=f"dates_{t.id}")
 
-                        # ── Multi-park editor ──
                         st.markdown("**Parks**")
                         with engine.connect() as conn2:
                             trip_parks_rows = get_trip_parks(conn2, t.id)
@@ -850,7 +985,6 @@ else:
                             key=f"parks_edit_{t.id}"
                         )
 
-                        # Notes editor — one text area per park
                         st.markdown("**Park Notes / Itinerary**")
                         park_notes_map = {}
                         existing_notes = {tp.park_name: tp.notes for tp in trip_parks_rows}
@@ -862,7 +996,6 @@ else:
                                 key=f"notes_{t.id}_{pname}"
                             )
 
-                        # ── Day-by-day activity editor ──
                         st.markdown("**Edit Day Activities**")
                         with engine.connect() as conn2:
                             saved_acts = conn2.execute(text("""
@@ -879,7 +1012,6 @@ else:
 
                         render_dnd_itinerary(edit_day_acts, edit_days, editable=True)
 
-                        # Add a new activity manually
                         st.markdown("**Add a new activity:**")
                         na1, na2, na3, na4 = st.columns([3, 2, 2, 1])
                         new_act_name = na1.text_input("Activity name", key=f"new_act_name_{t.id}")
@@ -899,7 +1031,6 @@ else:
                                     conn2.commit()
                                 st.rerun()
 
-                        # Move/delete saved activities
                         if saved_acts:
                             st.markdown("**Move or delete a saved activity:**")
                             for sa in saved_acts:
@@ -952,13 +1083,9 @@ else:
                                             "e": new_dates[1] if len(new_dates) > 1 else end,
                                             "tid": t.id
                                         })
-
-                                        # Remove parks no longer selected
                                         removed_parks = [tp for tp in trip_parks_rows if tp.park_name not in new_park_selection]
                                         for rp in removed_parks:
                                             conn2.execute(text("DELETE FROM trip_parks WHERE id=:tpkid"), {"tpkid": rp.trip_park_id})
-
-                                        # Update existing parks' notes / add new parks
                                         existing_park_names = {tp.park_name: tp.trip_park_id for tp in trip_parks_rows}
                                         for pname in new_park_selection:
                                             prow = all_parks[all_parks['name'] == pname]
@@ -974,7 +1101,6 @@ else:
                                                 conn2.execute(text("""
                                                     INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)
                                                 """), {"t": t.id, "p": pid, "n": notes})
-
                                     st.success("Trip updated! ✅")
                                     st.session_state[edit_key] = False
                                     st.rerun()
@@ -983,6 +1109,7 @@ else:
 
                     # ── READ-ONLY VIEW ──
                     else:
+                        # ── ACTIVITIES ──
                         with engine.connect() as conn2:
                             saved_acts = conn2.execute(text("""
                                 SELECT day_number, activity_name, activity_type
@@ -994,17 +1121,111 @@ else:
                             st.divider()
                             st.markdown("**Trip Activities:**")
                             view_days = date_range_days(t.start_date, t.end_date)
-                            day_map = {}
+                            day_act_map = {}
                             for a in saved_acts:
-                                day_map.setdefault(a.day_number, []).append(a)
-                            for day_num, day_date in view_days:
-                                acts = day_map.get(day_num, [])
-                                if acts:
-                                    st.markdown(f"**Day {day_num} — {day_date.strftime('%a, %b %d')}**")
-                                    for a in acts:
-                                        st.caption(f"  • {a.activity_name} _{a.activity_type}_")
+                                day_act_map.setdefault(a.day_number, []).append(a)
 
-                        # Show notes per park
+                            # ── TRIP NOTES / JOURNAL per day ──
+                            with engine.connect() as conn2:
+                                all_notes_rows = conn2.execute(text("""
+                                    SELECT tdn.id, tdn.day_number, tdn.note_text, tdn.created_at,
+                                           u.firstname, u.lastname, tdn.author_id
+                                    FROM trip_day_notes tdn
+                                    JOIN users u ON tdn.author_id = u.id
+                                    WHERE tdn.trip_id = :tid
+                                    ORDER BY tdn.day_number, tdn.created_at
+                                """), {"tid": t.id}).fetchall()
+                            notes_by_day = {}
+                            for n in all_notes_rows:
+                                notes_by_day.setdefault(n.day_number, []).append(n)
+
+                            for day_num, day_date in view_days:
+                                acts = day_act_map.get(day_num, [])
+                                day_notes = notes_by_day.get(day_num, [])
+                                if acts or day_notes:
+                                    with st.container(border=True):
+                                        st.markdown(f"**Day {day_num} — {day_date.strftime('%a, %b %d')}**")
+                                        # Activities
+                                        for a in acts:
+                                            st.caption(f"  • {a.activity_name} _{a.activity_type}_")
+
+                                        # Existing notes
+                                        if day_notes:
+                                            st.markdown("📝 **Notes:**")
+                                            for note in day_notes:
+                                                is_mine = note.author_id == current_uid
+                                                note_col1, note_col2 = st.columns([8, 1])
+                                                note_col1.markdown(
+                                                    f"> {note.note_text}  \n"
+                                                    f"<small>— {note.firstname} {note.lastname}, "
+                                                    f"{note.created_at.strftime('%b %d') if hasattr(note.created_at, 'strftime') else note.created_at}</small>",
+                                                    unsafe_allow_html=True
+                                                )
+                                                if is_mine:
+                                                    if note_col2.button("🗑️", key=f"del_note_{note.id}"):
+                                                        with engine.begin() as conn2:
+                                                            conn2.execute(text("DELETE FROM trip_day_notes WHERE id=:nid"), {"nid": note.id})
+                                                        st.rerun()
+
+                                        # Add note form (collaborators + owner)
+                                        if editable or t.role == "viewer":
+                                            note_key = f"note_input_{t.id}_{day_num}"
+                                            new_note = st.text_input(
+                                                f"Add a note for Day {day_num}",
+                                                placeholder="How did it go? Any tips for future visitors?",
+                                                key=note_key,
+                                                label_visibility="collapsed"
+                                            )
+                                            if st.button("💬 Add Note", key=f"add_note_{t.id}_{day_num}"):
+                                                if new_note.strip():
+                                                    with engine.begin() as conn2:
+                                                        conn2.execute(text("""
+                                                            INSERT INTO trip_day_notes (trip_id, day_number, author_id, note_text)
+                                                            VALUES (:tid, :day, :uid, :note)
+                                                        """), {"tid": t.id, "day": day_num, "uid": current_uid, "note": new_note.strip()})
+                                                    st.rerun()
+
+                        # ── PACKING LIST ──
+                        with engine.connect() as conn2:
+                            packing_rows = conn2.execute(text("""
+                                SELECT id, category, item_name, is_checked
+                                FROM trip_packing_items WHERE trip_id = :tid
+                                ORDER BY category, item_name
+                            """), {"tid": t.id}).fetchall()
+
+                        if packing_rows:
+                            st.divider()
+                            with st.expander("🎒 Packing List", expanded=False):
+                                # Group by category
+                                from itertools import groupby
+                                checked_count = sum(1 for p in packing_rows if p.is_checked)
+                                total_count = len(packing_rows)
+                                st.progress(checked_count / total_count if total_count else 0,
+                                            text=f"{checked_count}/{total_count} items packed")
+                                st.caption("Check items off as you pack!")
+
+                                categories = {}
+                                for row in packing_rows:
+                                    categories.setdefault(row.category, []).append(row)
+
+                                pack_cols = st.columns(2)
+                                cat_list = sorted(categories.items())
+                                for ci, (category, items) in enumerate(cat_list):
+                                    with pack_cols[ci % 2]:
+                                        st.markdown(f"**{category}**")
+                                        for item in items:
+                                            checked = st.checkbox(
+                                                item.item_name,
+                                                value=item.is_checked,
+                                                key=f"pack_{item.id}"
+                                            )
+                                            if checked != item.is_checked:
+                                                with engine.begin() as conn2:
+                                                    conn2.execute(text("""
+                                                        UPDATE trip_packing_items SET is_checked=:c WHERE id=:iid
+                                                    """), {"c": checked, "iid": item.id})
+
+                        # ── ITINERARY NOTES PER PARK ──
                         with engine.connect() as conn2:
                             trip_parks_rows = get_trip_parks(conn2, t.id)
                         if trip_parks_rows:
@@ -1014,7 +1235,7 @@ else:
                                     st.markdown(f"**📍 {tp.park_name}**")
                                     st.markdown(tp.notes)
 
-                    # Trip crew (always visible)
+                    # ── TRIP CREW ──
                     with engine.connect() as conn2:
                         participants = conn2.execute(text("""
                             SELECT u.firstname, u.lastname, u.username, tp.role, tp.invitation_status
