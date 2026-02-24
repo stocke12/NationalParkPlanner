@@ -28,11 +28,16 @@ for key, val in {
     "master_itinerary": "",
     "day_activities": {},   # {day_number: [{"name":..., "type":..., "id":...}]}
     "nights": 0,
+    "selected_parks": [],   # list of park names for multi-park trips
 }.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
-engine = get_connection()
+@st.cache_resource
+def get_engine():
+    return get_connection()
+
+engine = get_engine()
 
 # ─────────────────────────────────────────────
 # HELPERS
@@ -56,20 +61,25 @@ def get_pending_trip_invites(conn, uid):
         SELECT tp.id AS participant_id, t.id AS trip_id, t.trip_name,
                t.start_date, t.end_date,
                u_owner.firstname || ' ' || u_owner.lastname AS invited_by_name,
-               p.name AS park_name
+               STRING_AGG(p.name, ', ' ORDER BY p.name) AS park_names
         FROM trip_participants tp
         JOIN trips t ON tp.trip_id = t.id
         JOIN users u_owner ON t.owner_id = u_owner.id
         LEFT JOIN trip_parks tpk ON t.id = tpk.trip_id
         LEFT JOIN parks p ON tpk.park_id = p.id
         WHERE tp.user_id = :uid AND tp.invitation_status = 'pending' AND tp.role != 'owner'
+        GROUP BY tp.id, t.id, t.trip_name, t.start_date, t.end_date, u_owner.firstname, u_owner.lastname
     """), {"uid": uid}).fetchall()
 
 def get_pending_count(uid):
     with engine.connect() as conn:
-        fc = conn.execute(text("SELECT COUNT(*) FROM friendships WHERE friend_id=:uid AND status='pending'"), {"uid": uid}).scalar()
-        tc = conn.execute(text("SELECT COUNT(*) FROM trip_participants WHERE user_id=:uid AND invitation_status='pending' AND role!='owner'"), {"uid": uid}).scalar()
-    return (fc or 0) + (tc or 0)
+        result = conn.execute(text("""
+            SELECT
+                (SELECT COUNT(*) FROM friendships WHERE friend_id=:uid AND status='pending') +
+                (SELECT COUNT(*) FROM trip_participants WHERE user_id=:uid AND invitation_status='pending' AND role!='owner')
+            AS total
+        """), {"uid": uid}).scalar()
+    return result or 0
 
 def can_edit(role):
     return role in ('owner', 'collaborator')
@@ -88,6 +98,17 @@ def date_range_days(start, end):
         day += 1
     return days
 
+def get_trip_parks(conn, trip_id):
+    """Returns list of (trip_park_id, park_id, park_name, notes) for a trip."""
+    return conn.execute(text("""
+        SELECT tpk.id AS trip_park_id, tpk.park_id, p.name AS park_name,
+               p.image_url, tpk.notes
+        FROM trip_parks tpk
+        JOIN parks p ON tpk.park_id = p.id
+        WHERE tpk.trip_id = :tid
+        ORDER BY p.name
+    """), {"tid": trip_id}).fetchall()
+
 # ─────────────────────────────────────────────
 # DRAG-AND-DROP ITINERARY COMPONENT
 # ─────────────────────────────────────────────
@@ -95,7 +116,6 @@ def date_range_days(start, end):
 def render_dnd_itinerary(day_activities, days, editable=True):
     """
     Renders a drag-and-drop day-by-day itinerary using a custom HTML component.
-    Returns the updated day_activities dict after user interaction.
     """
     days_data = []
     for day_num, day_date in days:
@@ -185,13 +205,13 @@ def render_dnd_itinerary(day_activities, days, editable=True):
 
     <div class="itinerary-grid" id="itinerary">
         {"".join(f'''
-        <div class="day-col" id="day-{d["day"]}" 
+        <div class="day-col" id="day-{d["day"]}"
              ondragover="event.preventDefault(); this.querySelector('.drop-zone').classList.add('drag-over')"
              ondragleave="this.querySelector('.drop-zone').classList.remove('drag-over')"
              ondrop="handleDrop(event, {d['day']})">
             <div class="day-header">{d["label"]}</div>
             {"".join(f'''
-            <div class="activity-card" 
+            <div class="activity-card"
                  {draggable_attr}
                  data-id="{a["id"]}" data-day="{d["day"]}">
                 <div>
@@ -359,7 +379,6 @@ else:
                     fc1.write(f"**{f.firstname}** (@{f.username})")
                     fc1.caption(f"Style: {f.likes}")
 
-                    # ── DELETE FRIEND with confirmation ──
                     confirm_key = f"confirm_del_friend_{f.friendship_id}"
                     if confirm_key not in st.session_state:
                         st.session_state[confirm_key] = False
@@ -412,7 +431,7 @@ else:
         for inv in trip_invites:
             with st.container(border=True):
                 st.write(f"**{inv.trip_name}**")
-                st.caption(f"📍 {inv.park_name or 'Multiple Parks'}  •  📅 {inv.start_date} → {inv.end_date}  •  Invited by **{inv.invited_by_name}**")
+                st.caption(f"📍 {inv.park_names or 'Multiple Parks'}  •  📅 {inv.start_date} → {inv.end_date}  •  Invited by **{inv.invited_by_name}**")
                 col1, col2 = st.columns(2)
                 if col1.button("Accept 🎒", key=f"accept_trip_{inv.participant_id}"):
                     with engine.connect() as conn2:
@@ -439,8 +458,26 @@ else:
             friend_options = {fr[1]: fr[0] for fr in friends_res}
             df_parks = pd.read_sql(text("SELECT name, id FROM parks ORDER BY name"), conn)
 
-        p_sel = st.selectbox("Select Park", options=df_parks['name'])
+        # ── MULTI-PARK SELECTOR ──
+        st.markdown("**Select Parks** _(choose one or more)_")
+        selected_parks = st.multiselect(
+            "Parks",
+            options=df_parks['name'].tolist(),
+            default=st.session_state.selected_parks or [],
+            placeholder="Search and add parks...",
+            label_visibility="collapsed"
+        )
+        st.session_state.selected_parks = selected_parks
+
+        if not selected_parks:
+            st.info("Select at least one park to get started.")
+
         date_range = st.date_input("Dates", value=(date.today(), date.today()))
+
+        # Validate date range
+        if len(date_range) == 2 and date_range[1] < date_range[0]:
+            st.error("End date must be on or after start date.")
+            date_range = (date_range[0], date_range[0])
 
         st.markdown("**Invite Friends**")
         invite_roles = {}
@@ -452,13 +489,17 @@ else:
         else:
             st.caption("Add friends to invite them on trips.")
 
-        if st.button("🔍 Generate Plan"):
+        if st.button("🔍 Generate Plan", disabled=not selected_parks):
             if len(date_range) < 2:
                 st.error("Please select a date range.")
+            elif not selected_parks:
+                st.error("Please select at least one park.")
             else:
                 nights = (date_range[1] - date_range[0]).days
                 st.session_state.nights = nights
                 st.session_state.day_activities = {i + 1: [] for i in range(nights + 1)}
+
+                parks_label = ", ".join(selected_parks)
 
                 # Build group travel styles for the prompt
                 travel_styles = [f"{st.session_state.user_info['firstname']}: {st.session_state.user_info['likes']}"]
@@ -474,24 +515,31 @@ else:
                 group_styles = "\n".join(f"  - {s}" for s in travel_styles)
                 group_note = f"This is a group trip. Balance activities for everyone's styles:\n{group_styles}" if len(travel_styles) > 1 else f"Travel Style: {st.session_state.user_info['likes']}"
 
+                if len(selected_parks) == 1:
+                    parks_context = f"the park: {selected_parks[0]}"
+                    itinerary_context = f"a {nights}-night trip at {selected_parks[0]}"
+                else:
+                    parks_context = f"these parks: {parks_label}"
+                    itinerary_context = f"a {nights}-night multi-park trip visiting {parks_label}. Distribute days across parks logically based on geography and travel time."
+
                 prompt = f"""
-                Suggest 12 individual activities for {p_sel}.
+                Suggest 12 individual activities spread across {parks_context}.
                 {group_note}
-                Format each as: Name | Type | Brief description
+                Format each as: Name | Type | Park | Brief description
                 Only return the list, one activity per line.
 
                 ---MASTER_ITINERARY---
-                Provide a full day-by-day itinerary for {nights} nights at {p_sel}.
+                Provide a full day-by-day itinerary for {itinerary_context}.
                 {group_note}
                 """
                 with st.spinner("Scouting the trail..."):
-                    resp = client.models.generate_content(model="gemini-3-flash-preview", contents=prompt).text
+                    resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text
                     parts = resp.split('---MASTER_ITINERARY---')
                     st.session_state.temp_activities = [l for l in parts[0].strip().split('\n') if "|" in l]
                     st.session_state.master_itinerary = parts[1].strip() if len(parts) > 1 else ""
 
         # ── ACTIVITY PICKER + DAY-BY-DAY BOARD ──
-        if st.session_state.temp_activities and len(date_range) == 2:
+        if st.session_state.temp_activities and len(date_range) == 2 and selected_parks:
             st.divider()
             days = date_range_days(date_range[0], date_range[1])
 
@@ -501,21 +549,24 @@ else:
                 st.subheader("💡 Suggested Activities")
                 st.caption("Check activities to add them to a day")
 
-                # Park image
+                # Show park images for all selected parks
                 with engine.connect() as conn:
-                    park_img = conn.execute(text("SELECT image_url FROM parks WHERE name = :n"), {"n": p_sel}).scalar()
-                if park_img:
-                    st.image(park_img, use_container_width=True)
+                    for park_name in selected_parks:
+                        park_img = conn.execute(text("SELECT image_url FROM parks WHERE name = :n"), {"n": park_name}).scalar()
+                        if park_img:
+                            st.image(park_img, caption=park_name, use_container_width=True)
 
                 for i, act in enumerate(st.session_state.temp_activities):
                     parts = act.split('|')
                     name = parts[0].strip()
                     a_type = parts[1].strip() if len(parts) > 1 else "Activity"
+                    # Park column is now the 3rd element (index 2) if present
+                    a_park = parts[2].strip() if len(parts) > 2 else ""
 
                     with st.container(border=True):
                         ac1, ac2, ac3 = st.columns([2, 2, 1])
                         ac1.markdown(f"**{name}**")
-                        ac1.caption(a_type)
+                        ac1.caption(f"{a_type}" + (f" · {a_park}" if a_park else ""))
                         target_day = ac2.selectbox(
                             "Day", options=[d[0] for d in days],
                             format_func=lambda d: f"Day {d}",
@@ -525,7 +576,6 @@ else:
                             activity_entry = {"id": f"act_{i}_{target_day}", "name": name, "type": a_type}
                             if target_day not in st.session_state.day_activities:
                                 st.session_state.day_activities[target_day] = []
-                            # Avoid duplicates
                             existing_names = [a["name"] for a in st.session_state.day_activities[target_day]]
                             if name not in existing_names:
                                 st.session_state.day_activities[target_day].append(activity_entry)
@@ -538,7 +588,7 @@ else:
 
                 render_dnd_itinerary(st.session_state.day_activities, days, editable=True)
 
-                # Manual move fallback using dropdowns (works reliably in Streamlit)
+                # Manual move fallback
                 st.divider()
                 st.markdown("**Move an activity between days:**")
                 all_placed = []
@@ -567,47 +617,61 @@ else:
                 st.markdown(st.session_state.master_itinerary)
 
                 if st.button("💾 Save Trip"):
-                    try:
-                        with engine.begin() as conn:
-                            tid_res = conn.execute(text("""
-                                INSERT INTO trips (user_id, owner_id, trip_name, start_date, end_date)
-                                VALUES (:u, :u, :n, :s, :e) RETURNING id
-                            """), {"u": current_uid, "n": f"{p_sel} Trip", "s": date_range[0], "e": date_range[1]}).fetchone()
-                            tid = tid_res[0]
+                    if not selected_parks:
+                        st.error("No parks selected.")
+                    else:
+                        try:
+                            parks_label = ", ".join(selected_parks)
+                            trip_name = f"{parks_label} Trip" if len(selected_parks) == 1 else f"Multi-Park Trip: {parks_label}"
 
-                            conn.execute(text("""
-                                INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by)
-                                VALUES (:t, :u, 'owner', 'accepted', :u)
-                            """), {"t": tid, "u": current_uid})
+                            with engine.begin() as conn:
+                                tid_res = conn.execute(text("""
+                                    INSERT INTO trips (user_id, owner_id, trip_name, start_date, end_date)
+                                    VALUES (:u, :u, :n, :s, :e) RETURNING id
+                                """), {"u": current_uid, "n": trip_name, "s": date_range[0], "e": date_range[1]}).fetchone()
+                                tid = tid_res[0]
 
-                            for f_name, f_role in invite_roles.items():
-                                fid = friend_options.get(f_name)
-                                if fid:
-                                    conn.execute(text("""
-                                        INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by)
-                                        VALUES (:t, :u, :role, 'pending', :inviter)
-                                    """), {"t": tid, "u": fid, "role": f_role, "inviter": current_uid})
+                                conn.execute(text("""
+                                    INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by)
+                                    VALUES (:t, :u, 'owner', 'accepted', :u)
+                                """), {"t": tid, "u": current_uid})
 
-                            p_id = int(df_parks[df_parks['name'] == p_sel]['id'].iloc[0])
-                            notes_text = f"MASTER ITINERARY:\n{st.session_state.master_itinerary}"
-                            conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)"),
-                                         {"t": tid, "p": p_id, "n": notes_text})
+                                for f_name, f_role in invite_roles.items():
+                                    fid = friend_options.get(f_name)
+                                    if fid:
+                                        conn.execute(text("""
+                                            INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by)
+                                            VALUES (:t, :u, :role, 'pending', :inviter)
+                                        """), {"t": tid, "u": fid, "role": f_role, "inviter": current_uid})
 
-                            # Save day-by-day activities
-                            for day_num, activities in st.session_state.day_activities.items():
-                                for order, act in enumerate(activities):
-                                    conn.execute(text("""
-                                        INSERT INTO trip_activities (trip_id, day_number, activity_name, activity_type, sort_order)
-                                        VALUES (:tid, :day, :name, :atype, :order)
-                                    """), {"tid": tid, "day": day_num, "name": act["name"], "atype": act.get("type", ""), "order": order})
+                                # ── Insert ALL selected parks into trip_parks ──
+                                for park_name in selected_parks:
+                                    park_row = df_parks[df_parks['name'] == park_name]
+                                    if not park_row.empty:
+                                        p_id = int(park_row['id'].iloc[0])
+                                        # Attach master itinerary notes only to first park to avoid duplication
+                                        notes_text = f"MASTER ITINERARY:\n{st.session_state.master_itinerary}" if park_name == selected_parks[0] else ""
+                                        conn.execute(text("""
+                                            INSERT INTO trip_parks (trip_id, park_id, notes)
+                                            VALUES (:t, :p, :n)
+                                        """), {"t": tid, "p": p_id, "n": notes_text})
 
-                        st.success("Adventure locked in! 🎉")
-                        st.balloons()
-                        st.session_state.day_activities = {}
-                        st.session_state.temp_activities = []
+                                # Save day-by-day activities
+                                for day_num, activities in st.session_state.day_activities.items():
+                                    for order, act in enumerate(activities):
+                                        conn.execute(text("""
+                                            INSERT INTO trip_activities (trip_id, day_number, activity_name, activity_type, sort_order)
+                                            VALUES (:tid, :day, :name, :atype, :order)
+                                        """), {"tid": tid, "day": day_num, "name": act["name"], "atype": act.get("type", ""), "order": order})
 
-                    except Exception as e:
-                        st.error(f"Database Error: {e}")
+                            st.success("Adventure locked in! 🎉")
+                            st.balloons()
+                            st.session_state.day_activities = {}
+                            st.session_state.temp_activities = []
+                            st.session_state.selected_parks = []
+
+                        except Exception as e:
+                            st.error(f"Database Error: {e}")
 
     # ─────────────────────────────────────────────
     # MY TRIPS TAB
@@ -616,10 +680,11 @@ else:
         st.header("Your Adventures")
 
         with engine.connect() as conn:
+            # Aggregate park names with STRING_AGG to avoid duplicate trip rows
             trips = conn.execute(text("""
                 SELECT DISTINCT t.id, t.trip_name, t.start_date, t.end_date,
-                       tpk.id AS trip_park_id, tpk.notes,
-                       p.name AS park_name, p.image_url AS park_image,
+                       STRING_AGG(DISTINCT p.name, ', ' ORDER BY p.name) AS park_names,
+                       STRING_AGG(DISTINCT p.image_url, '|' ORDER BY p.image_url) AS park_images,
                        u_owner.firstname || ' ' || u_owner.lastname AS owner_name,
                        tp.role
                 FROM trips t
@@ -628,6 +693,7 @@ else:
                 LEFT JOIN trip_parks tpk ON t.id = tpk.trip_id
                 LEFT JOIN parks p ON tpk.park_id = p.id
                 WHERE tp.user_id = :uid AND tp.invitation_status = 'accepted'
+                GROUP BY t.id, t.trip_name, t.start_date, t.end_date, u_owner.firstname, u_owner.lastname, tp.role
                 ORDER BY t.start_date DESC
             """), {"uid": current_uid}).fetchall()
             all_parks = pd.read_sql(text("SELECT name, id FROM parks ORDER BY name"), conn)
@@ -641,8 +707,15 @@ else:
                 editable = can_edit(t.role)
 
                 with st.expander(label):
-                    if t.park_image:
-                        st.image(t.park_image, use_container_width=True)
+                    # Show images for all parks in the trip
+                    if t.park_images:
+                        imgs = [img for img in t.park_images.split('|') if img]
+                        if imgs:
+                            img_cols = st.columns(min(len(imgs), 3))
+                            park_name_list = t.park_names.split(', ') if t.park_names else []
+                            for idx, img_url in enumerate(imgs[:3]):
+                                cap = park_name_list[idx] if idx < len(park_name_list) else ""
+                                img_cols[idx].image(img_url, caption=cap, use_container_width=True)
 
                     edit_key = f"editing_{t.id}"
                     confirm_del_key = f"confirm_del_trip_{t.id}"
@@ -653,7 +726,7 @@ else:
 
                     col_info, col_btns = st.columns([3, 1])
                     with col_info:
-                        st.caption(f"📅 {t.start_date} → {t.end_date}  •  🏔️ {t.park_name or 'Multiple Parks'}")
+                        st.caption(f"📅 {t.start_date} → {t.end_date}  •  🏔️ {t.park_names or 'No Parks'}")
                         if t.role != "owner":
                             st.caption(f"Planned by **{t.owner_name}**")
                     with col_btns:
@@ -662,11 +735,18 @@ else:
                             if st.button(toggle_label, key=f"toggle_edit_{t.id}"):
                                 st.session_state[edit_key] = not st.session_state[edit_key]
                                 st.rerun()
-                        if t.notes:
-                            pdf_b = create_pdf(t.notes, t.trip_name, st.session_state.user_info['firstname'])
+
+                        # Build combined notes for PDF from all parks
+                        with engine.connect() as conn_pdf:
+                            trip_parks_rows = get_trip_parks(conn_pdf, t.id)
+                        all_notes = "\n\n".join(
+                            f"=== {tp.park_name} ===\n{tp.notes}" for tp in trip_parks_rows if tp.notes
+                        )
+                        if all_notes:
+                            pdf_b = create_pdf(all_notes, t.trip_name, st.session_state.user_info['firstname'])
                             st.download_button("📥 PDF", pdf_b, f"Trip_{t.id}.pdf", key=f"dl_{t.id}")
 
-                        # ── DELETE TRIP (owner only) with confirmation ──
+                        # Delete trip (owner only)
                         if t.role == "owner":
                             if not st.session_state[confirm_del_key]:
                                 if st.button("🗑️ Delete", key=f"del_trip_btn_{t.id}"):
@@ -695,14 +775,33 @@ else:
                         start = t.start_date if isinstance(t.start_date, date) else (date.fromisoformat(str(t.start_date)) if t.start_date else date.today())
                         end = t.end_date if isinstance(t.end_date, date) else (date.fromisoformat(str(t.end_date)) if t.end_date else date.today())
                         new_dates = st.date_input("Dates", value=(start, end), key=f"dates_{t.id}")
-                        new_park = st.selectbox(
-                            "Park", options=all_parks['name'],
-                            index=int(all_parks[all_parks['name'] == t.park_name].index[0]) if t.park_name in all_parks['name'].values else 0,
-                            key=f"park_{t.id}"
-                        )
-                        new_notes = st.text_area("Itinerary Notes", value=t.notes or "", height=250, key=f"notes_{t.id}")
 
-                        # ── Day-by-day activity editor in edit mode ──
+                        # ── Multi-park editor ──
+                        st.markdown("**Parks**")
+                        with engine.connect() as conn2:
+                            trip_parks_rows = get_trip_parks(conn2, t.id)
+
+                        current_park_names = [tp.park_name for tp in trip_parks_rows]
+                        new_park_selection = st.multiselect(
+                            "Select Parks",
+                            options=all_parks['name'].tolist(),
+                            default=current_park_names,
+                            key=f"parks_edit_{t.id}"
+                        )
+
+                        # Notes editor — one text area per park
+                        st.markdown("**Park Notes / Itinerary**")
+                        park_notes_map = {}
+                        existing_notes = {tp.park_name: tp.notes for tp in trip_parks_rows}
+                        for pname in new_park_selection:
+                            park_notes_map[pname] = st.text_area(
+                                f"Notes for {pname}",
+                                value=existing_notes.get(pname, ""),
+                                height=150,
+                                key=f"notes_{t.id}_{pname}"
+                            )
+
+                        # ── Day-by-day activity editor ──
                         st.markdown("**Edit Day Activities**")
                         with engine.connect() as conn2:
                             saved_acts = conn2.execute(text("""
@@ -779,28 +878,50 @@ else:
                                     st.rerun()
 
                         if st.button("💾 Save Changes", key=f"save_{t.id}"):
-                            try:
-                                new_park_id = int(all_parks[all_parks['name'] == new_park]['id'].iloc[0])
-                                with engine.begin() as conn2:
-                                    conn2.execute(text("""
-                                        UPDATE trips SET trip_name=:name, start_date=:s, end_date=:e WHERE id=:tid
-                                    """), {
-                                        "name": new_name,
-                                        "s": new_dates[0] if len(new_dates) > 1 else start,
-                                        "e": new_dates[1] if len(new_dates) > 1 else end,
-                                        "tid": t.id
-                                    })
-                                    conn2.execute(text("UPDATE trip_parks SET park_id=:p, notes=:n WHERE id=:tpkid"),
-                                                  {"p": new_park_id, "n": new_notes, "tpkid": t.trip_park_id})
-                                st.success("Trip updated! ✅")
-                                st.session_state[edit_key] = False
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error saving: {e}")
+                            if not new_park_selection:
+                                st.error("Please select at least one park.")
+                            else:
+                                try:
+                                    with engine.begin() as conn2:
+                                        conn2.execute(text("""
+                                            UPDATE trips SET trip_name=:name, start_date=:s, end_date=:e WHERE id=:tid
+                                        """), {
+                                            "name": new_name,
+                                            "s": new_dates[0] if len(new_dates) > 1 else start,
+                                            "e": new_dates[1] if len(new_dates) > 1 else end,
+                                            "tid": t.id
+                                        })
+
+                                        # Remove parks no longer selected
+                                        removed_parks = [tp for tp in trip_parks_rows if tp.park_name not in new_park_selection]
+                                        for rp in removed_parks:
+                                            conn2.execute(text("DELETE FROM trip_parks WHERE id=:tpkid"), {"tpkid": rp.trip_park_id})
+
+                                        # Update existing parks' notes / add new parks
+                                        existing_park_names = {tp.park_name: tp.trip_park_id for tp in trip_parks_rows}
+                                        for pname in new_park_selection:
+                                            prow = all_parks[all_parks['name'] == pname]
+                                            if prow.empty:
+                                                continue
+                                            pid = int(prow['id'].iloc[0])
+                                            notes = park_notes_map.get(pname, "")
+                                            if pname in existing_park_names:
+                                                conn2.execute(text("""
+                                                    UPDATE trip_parks SET park_id=:p, notes=:n WHERE id=:tpkid
+                                                """), {"p": pid, "n": notes, "tpkid": existing_park_names[pname]})
+                                            else:
+                                                conn2.execute(text("""
+                                                    INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t, :p, :n)
+                                                """), {"t": t.id, "p": pid, "n": notes})
+
+                                    st.success("Trip updated! ✅")
+                                    st.session_state[edit_key] = False
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error saving: {e}")
 
                     # ── READ-ONLY VIEW ──
                     else:
-                        # Show saved day activities
                         with engine.connect() as conn2:
                             saved_acts = conn2.execute(text("""
                                 SELECT day_number, activity_name, activity_type
@@ -822,9 +943,15 @@ else:
                                     for a in acts:
                                         st.caption(f"  • {a.activity_name} _{a.activity_type}_")
 
-                        if t.notes:
+                        # Show notes per park
+                        with engine.connect() as conn2:
+                            trip_parks_rows = get_trip_parks(conn2, t.id)
+                        if trip_parks_rows:
                             st.divider()
-                            st.markdown(t.notes)
+                            for tp in trip_parks_rows:
+                                if tp.notes:
+                                    st.markdown(f"**📍 {tp.park_name}**")
+                                    st.markdown(tp.notes)
 
                     # Trip crew (always visible)
                     with engine.connect() as conn2:
