@@ -7,7 +7,6 @@ from sqlalchemy import text
 from database import get_connection
 
 # --- CONFIGURATION ---
-# Note: In a production environment, it's safer to pull this from os.getenv("NPS_API_KEY")
 NPS_API_KEY = "dZfBlMQvmHe03hV0Mt4O1EQqGZfEvIyr0EwQDaTh"
 HEADERS = {"X-Api-Key": NPS_API_KEY}
 
@@ -133,7 +132,6 @@ def fetch_and_sync_alerts(engine):
 
     df_alerts = pd.DataFrame(alerts_data)
     
-    # FIX 1: Set timezone to Mountain Standard Time (MST) so it matches your local clock
     mountain_tz = pytz.timezone('America/Denver')
     now = datetime.now(mountain_tz)
     print(f"Current Sync Time (MST): {now.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -163,7 +161,6 @@ def fetch_and_sync_alerts(engine):
             except Exception as e:
                 print(f"Error syncing alert {row['nps_id']}: {e}")
 
-        # FIX 2: Added a 10-minute buffer to prevent instant deactivation
         buffer_time = now - timedelta(minutes=10)
         conn.execute(text("""
             UPDATE alerts 
