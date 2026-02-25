@@ -230,8 +230,7 @@ def fetch_and_sync_parks(engine):
                     ON CONFLICT (npid) DO UPDATE SET
                         name      = EXCLUDED.name,
                         state     = EXCLUDED.state,
-                        code      = EXCLUDED.code,
-                        image_url = EXCLUDED.image_url;
+                        code      = EXCLUDED.code;
                 """), {
                     "name": row['Park Name'],
                     "npid": row['Id'],
