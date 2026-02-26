@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import re
 import json
+import bcrypt
 import pandas as pd
 from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
@@ -35,7 +36,10 @@ for key, val in {
     "activity_day_defaults": {},
     "park_distances": [],
     "conflict_warnings": {},
-    "active_parks_saved": [],   # FIX: stable copy of parks set at generate time
+    "active_parks_saved": [],
+    # auth flow state
+    "auth_screen": "login",  # login | set_password | force_change | reset | signup
+    "pending_uid": None,     # user id mid-flow
 }.items():
     if key not in st.session_state:
         st.session_state[key] = val
@@ -458,40 +462,208 @@ def render_dnd_itinerary(day_activities, days, editable=True, conflict_warnings=
 
 
 # ─────────────────────────────────────────────
+# PASSWORD HELPERS
+# ─────────────────────────────────────────────
+
+def hash_password(plain: str) -> str:
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
+
+def check_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode(), hashed.encode())
+    except Exception:
+        return False
+
+def validate_password(pw: str) -> str | None:
+    """Return an error string if invalid, None if fine."""
+    if len(pw) < 8:
+        return "Password must be at least 8 characters."
+    if not re.search(r"[A-Za-z]", pw):
+        return "Password must contain at least one letter."
+    if not re.search(r"[0-9]", pw):
+        return "Password must contain at least one number."
+    return None
+
+def dob_to_password(dob: date) -> str:
+    """Convert a date of birth to the MMDDYYYY reset password string."""
+    return dob.strftime("%m%d%Y")
+
+def is_dob_password(plain: str, dob: date) -> bool:
+    """Check whether the supplied plain password matches the DOB reset value."""
+    return plain == dob_to_password(dob)
+
+# ─────────────────────────────────────────────
 # AUTH
 # ─────────────────────────────────────────────
 
 if not st.session_state.logged_in:
     st.title("🌲 National Park Planner 🐻")
-    t1, t2 = st.tabs(["Login", "Create Account"])
-    with t1:
-        u = st.text_input("Username").strip().lower()
-        if st.button("Login"):
-            with engine.connect() as conn:
-                res = conn.execute(
-                    text("SELECT id, username, firstname, lastname, email, likes FROM users WHERE username = :u"),
-                    {"u": u}
-                ).mappings().fetchone()
-                if res:
-                    st.session_state.user_info = dict(res)
-                    st.session_state.logged_in = True
-                    st.rerun()
-                else:
-                    st.error("User not found.")
-    with t2:
-        nu = st.text_input("New Username").strip().lower()
-        fn, ln, em = st.text_input("First Name"), st.text_input("Last Name"), st.text_input("Email")
-        lk = st.text_area("Travel Style")
-        if st.button("Sign Up"):
-            try:
+
+    screen = st.session_state.auth_screen
+
+    # ── FORCE PASSWORD CHANGE (logged in via DOB reset or first-time setup) ─
+    if screen in ("set_password", "force_change"):
+        if screen == "set_password":
+            st.subheader("🔒 Set your password")
+            st.info("Your account was created before passwords were required. Please set a password to continue.")
+        else:
+            st.subheader("🔒 Please set a new password")
+            st.warning("You logged in with your temporary password. Choose a new password to continue.")
+
+        pw1 = st.text_input("New password", type="password", key="fc_pw1")
+        pw2 = st.text_input("Confirm password", type="password", key="fc_pw2")
+        if st.button("Set Password", use_container_width=True):
+            err = validate_password(pw1)
+            if err:
+                st.error(err)
+            elif pw1 != pw2:
+                st.error("Passwords don't match.")
+            else:
                 with engine.begin() as conn:
                     conn.execute(
-                        text("INSERT INTO users (username, firstname, lastname, email, likes) VALUES (:u,:f,:ln,:e,:l)"),
-                        {"u": nu, "f": fn, "ln": ln, "e": em, "l": lk}
+                        text("UPDATE users SET password_hash=:ph WHERE id=:uid"),
+                        {"ph": hash_password(pw1), "uid": st.session_state.pending_uid}
                     )
-                st.success("Account created!")
-            except Exception as e:
-                st.error(f"Error: {e}")
+                with engine.connect() as conn:
+                    res = conn.execute(
+                        text("SELECT id, username, firstname, lastname, email, likes, date_of_birth FROM users WHERE id=:uid"),
+                        {"uid": st.session_state.pending_uid}
+                    ).mappings().fetchone()
+                st.session_state.user_info = {k: v for k, v in res.items() if k != "date_of_birth"}
+                st.session_state.logged_in = True
+                st.session_state.auth_screen = "login"
+                st.session_state.pending_uid = None
+                st.rerun()
+        if st.button("Back to Login", type="tertiary"):
+            st.session_state.auth_screen = "login"
+            st.session_state.pending_uid = None
+            st.rerun()
+
+    # ── RESET PASSWORD (DOB lookup) ─────────────────────────────────────────
+    elif screen == "reset":
+        st.subheader("🔑 Reset your password")
+        st.caption("Enter your username and date of birth. Your password will be reset to your DOB (MMDDYYYY) and you'll be prompted to change it on login.")
+        reset_u   = st.text_input("Username").strip().lower()
+        reset_dob = st.date_input("Date of Birth", min_value=date(1900, 1, 1), max_value=date.today(), value=None)
+        if st.button("Reset Password", use_container_width=True):
+            if not reset_u or not reset_dob:
+                st.error("Please fill in both fields.")
+            else:
+                with engine.connect() as conn:
+                    row = conn.execute(
+                        text("SELECT id, date_of_birth FROM users WHERE username=:u"),
+                        {"u": reset_u}
+                    ).fetchone()
+                # Same error for wrong username or wrong DOB — no enumeration
+                if not row or not row.date_of_birth:
+                    st.error("No account found with that username and date of birth.")
+                else:
+                    stored_dob = row.date_of_birth if isinstance(row.date_of_birth, date) else row.date_of_birth.date()
+                    if stored_dob != reset_dob:
+                        st.error("No account found with that username and date of birth.")
+                    else:
+                        # Reset password to MMDDYYYY
+                        dob_pw = dob_to_password(stored_dob)
+                        with engine.begin() as conn:
+                            conn.execute(
+                                text("UPDATE users SET password_hash=:ph WHERE id=:uid"),
+                                {"ph": hash_password(dob_pw), "uid": row.id}
+                            )
+                        st.success(f"Password reset! Log in with your username and **{dob_pw}** — you'll be prompted to set a new password.")
+                        st.session_state.auth_screen = "login"
+                        st.rerun()
+        if st.button("Back to Login", type="tertiary"):
+            st.session_state.auth_screen = "login"
+            st.rerun()
+
+    # ── SIGN UP ─────────────────────────────────────────────────────────────
+    elif screen == "signup":
+        st.subheader("🌲 Create Account")
+        nu  = st.text_input("Username").strip().lower()
+        fn  = st.text_input("First Name")
+        ln  = st.text_input("Last Name")
+        em  = st.text_input("Email")
+        dob = st.date_input("Date of Birth", min_value=date(1900, 1, 1), max_value=date.today(), value=None,
+                             help="Used to reset your password if you forget it")
+        lk  = st.text_area("Travel Style / Interests")
+        pw1 = st.text_input("Password", type="password", key="su_pw1")
+        pw2 = st.text_input("Confirm Password", type="password", key="su_pw2")
+        if st.button("Sign Up", use_container_width=True):
+            if not nu:
+                st.error("Username is required.")
+            elif not dob:
+                st.error("Date of birth is required.")
+            else:
+                err = validate_password(pw1)
+                if err:
+                    st.error(err)
+                elif pw1 != pw2:
+                    st.error("Passwords don't match.")
+                else:
+                    try:
+                        with engine.begin() as conn:
+                            conn.execute(
+                                text("INSERT INTO users (username, firstname, lastname, email, likes, password_hash, date_of_birth) VALUES (:u,:f,:ln,:e,:l,:ph,:dob)"),
+                                {"u": nu, "f": fn, "ln": ln, "e": em, "l": lk, "ph": hash_password(pw1), "dob": dob}
+                            )
+                        st.success("Account created! You can now log in.")
+                        st.session_state.auth_screen = "login"
+                        st.rerun()
+                    except Exception as e:
+                        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                            st.error("That username is already taken.")
+                        else:
+                            st.error(f"Error: {e}")
+        if st.button("Already have an account? Log in", type="tertiary"):
+            st.session_state.auth_screen = "login"
+            st.rerun()
+
+    # ── LOGIN ────────────────────────────────────────────────────────────────
+    else:
+        st.subheader("Welcome back")
+        u  = st.text_input("Username").strip().lower()
+        pw = st.text_input("Password", type="password", key="login_pw")
+        if st.button("Log In", use_container_width=True):
+            with engine.connect() as conn:
+                res = conn.execute(
+                    text("SELECT id, username, firstname, lastname, email, likes, password_hash, date_of_birth FROM users WHERE username=:u"),
+                    {"u": u}
+                ).mappings().fetchone()
+
+            if not res:
+                st.error("Invalid username or password.")
+            elif not res["password_hash"]:
+                # Pre-password account — force setup without checking password
+                st.session_state.pending_uid = res["id"]
+                st.session_state.auth_screen = "set_password"
+                st.rerun()
+            elif not check_password(pw, res["password_hash"]):
+                st.error("Invalid username or password.")
+            else:
+                # Valid password — check if they logged in with their DOB reset password
+                dob = res["date_of_birth"]
+                logged_in_with_dob = (
+                    dob is not None and
+                    is_dob_password(pw, dob if isinstance(dob, date) else dob.date() if hasattr(dob, 'date') else dob)
+                )
+                st.session_state.pending_uid = res["id"]
+                st.session_state.user_info = {k: v for k, v in res.items() if k not in ("password_hash", "date_of_birth")}
+                if logged_in_with_dob:
+                    st.session_state.auth_screen = "force_change"
+                    st.rerun()
+                else:
+                    st.session_state.logged_in = True
+                    st.session_state.auth_screen = "login"
+                    st.session_state.pending_uid = None
+                    st.rerun()
+
+        col1, col2 = st.columns(2)
+        if col1.button("Create account", use_container_width=True):
+            st.session_state.auth_screen = "signup"
+            st.rerun()
+        if col2.button("Forgot password?", use_container_width=True):
+            st.session_state.auth_screen = "reset"
+            st.rerun()
 
 # ─────────────────────────────────────────────
 # MAIN APP
@@ -528,9 +700,35 @@ else:
                     st.error(f"Error: {e}")
 
         st.divider()
+        with st.expander("🔒 Change Password"):
+            cp_current = st.text_input("Current password", type="password", key="cp_current")
+            cp_new1    = st.text_input("New password",     type="password", key="cp_new1")
+            cp_new2    = st.text_input("Confirm new",      type="password", key="cp_new2")
+            if st.button("Update Password", use_container_width=True):
+                with engine.connect() as conn:
+                    row = conn.execute(text("SELECT password_hash FROM users WHERE id=:uid"),
+                                       {"uid": current_uid}).fetchone()
+                if not row or not row.password_hash:
+                    st.error("No password set on this account.")
+                elif not check_password(cp_current, row.password_hash):
+                    st.error("Current password is incorrect.")
+                else:
+                    err = validate_password(cp_new1)
+                    if err:
+                        st.error(err)
+                    elif cp_new1 != cp_new2:
+                        st.error("New passwords don't match.")
+                    else:
+                        with engine.begin() as conn:
+                            conn.execute(text("UPDATE users SET password_hash=:ph WHERE id=:uid"),
+                                         {"ph": hash_password(cp_new1), "uid": current_uid})
+                        st.success("Password updated!")
+
+        st.divider()
         if st.button("Log Out", use_container_width=True):
             st.session_state.logged_in = False
             st.session_state.user_info = None
+            st.session_state.auth_screen = "login"
             st.rerun()
 
     plan_tab, explorer_tab, friend_tab, my_trips_tab, stats_tab, notif_tab = st.tabs([
