@@ -223,7 +223,7 @@ Respond ONLY as a JSON array, no markdown, no extra text. Each element:
 {{"from": "...", "to": "...", "drive_time": "e.g. 3h 20min", "distance_miles": 210, "tip": "one short travel tip"}}
 Pairs:\n{pair_text}"""
     try:
-        resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text
+        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text
         return json.loads(re.sub(r"```json|```", "", resp).strip())
     except Exception:
         return []
@@ -237,7 +237,7 @@ Respond ONLY as a JSON array, no markdown, no extra text. Each element:
 {{"category": "e.g. Clothing", "item": "e.g. Moisture-wicking shirt x3"}}
 Include 25-35 items across: Clothing, Footwear, Navigation, Safety, Camping/Shelter, Food & Water, Photography, Personal Care, Documents."""
     try:
-        resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text
+        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text
         return json.loads(re.sub(r"```json|```", "", resp).strip())
     except Exception:
         return []
@@ -258,7 +258,7 @@ Journal notes from the trip:
 
 Write 3-4 paragraphs in a warm, storytelling style — like a travel journal entry. Mention specific activities and any notes. End with a memorable closing line."""
     try:
-        return client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text.strip()
+        return client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text.strip()
     except Exception:
         return ""
 
@@ -745,8 +745,9 @@ else:
             st.session_state.auth_screen = "login"
             st.rerun()
 
-    plan_tab, explorer_tab, friend_tab, my_trips_tab, stats_tab, notif_tab = st.tabs([
-        "🗺️ Plan Trip", "🔭 Park Explorer", "👥 Friends", "🎒 My Trips", "📊 My Stats", "🔔 Notifications"
+    plan_tab, explorer_tab, friend_tab, my_trips_tab, stats_tab, passport_tab, discover_tab, gear_tab, notif_tab = st.tabs([
+        "🗺️ Plan Trip", "🔭 Park Explorer", "👥 Friends", "🎒 My Trips", "📊 My Stats",
+        "🗺 Passport", "🌍 Discover", "🎒 Gear", "🔔 Notifications"
     ])
 
     # ─────────────────────────────────────────────
@@ -1815,3 +1816,665 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                             status_icon = "✅" if p.invitation_status=="accepted" else "⏳" if p.invitation_status=="pending" else "❌"
                             role_icon   = "👑" if p.role=="owner" else "✏️" if p.role=="collaborator" else "👁️"
                             st.caption(f"{status_icon} {p.firstname} {p.lastname} (@{p.username}) — {role_icon} {p.role}")
+
+                    # ── CROWD CALENDAR & SEASONAL WARNINGS ─────────────────
+                    with engine.connect() as conn2:
+                        trip_park_ids_cc = [tp.park_id for tp in get_trip_parks(conn2, t.id)]
+                    if trip_park_ids_cc:
+                        trip_month = t.start_date.month if isinstance(t.start_date, date) else (date.fromisoformat(str(t.start_date)).month if t.start_date else None)
+                        if trip_month:
+                            with engine.connect() as conn2:
+                                crowd_rows = conn2.execute(text("""
+                                    SELECT p.name AS park_name, pcc.crowd_level, pcc.notes
+                                    FROM park_crowd_calendar pcc
+                                    JOIN parks p ON pcc.park_id=p.id
+                                    WHERE pcc.park_id=ANY(:pids) AND pcc.month=:m
+                                    ORDER BY p.name
+                                """), {"pids": trip_park_ids_cc, "m": trip_month}).fetchall()
+                                warn_rows = conn2.execute(text("""
+                                    SELECT p.name AS park_name, psw.warning_type, psw.description
+                                    FROM park_seasonal_warnings psw
+                                    JOIN parks p ON psw.park_id=p.id
+                                    WHERE psw.park_id=ANY(:pids)
+                                      AND (
+                                        (psw.month_start <= psw.month_end AND :m BETWEEN psw.month_start AND psw.month_end)
+                                        OR (psw.month_start > psw.month_end AND (:m >= psw.month_start OR :m <= psw.month_end))
+                                      )
+                                    ORDER BY p.name
+                                """), {"pids": trip_park_ids_cc, "m": trip_month}).fetchall()
+                            if crowd_rows or warn_rows:
+                                st.divider()
+                                crowd_icon = {"Low": "🟢", "Moderate": "🟡", "High": "🟠", "Very High": "🔴"}
+                                if crowd_rows:
+                                    with st.expander(f"📅 Crowd Forecast for your travel month", expanded=False):
+                                        for cr in crowd_rows:
+                                            icon = crowd_icon.get(cr.crowd_level, "⚪")
+                                            st.markdown(f"**{cr.park_name}** — {icon} {cr.crowd_level}")
+                                            if cr.notes:
+                                                st.caption(cr.notes)
+                                if warn_rows:
+                                    warn_icons = {"Closure": "🚫", "Snow": "❄️", "Heat": "🌡️",
+                                                  "Flooding": "🌊", "Wildlife": "🐻", "Smoke": "💨", "Lightning": "⚡"}
+                                    with st.expander(f"⚠️ {len(warn_rows)} seasonal warning(s) for this month", expanded=False):
+                                        for wr in warn_rows:
+                                            wi = warn_icons.get(wr.warning_type, "⚠️")
+                                            st.warning(f"**{wr.park_name}** — {wi} {wr.warning_type}: {wr.description}")
+
+                    # ── EXPENSE TRACKER ─────────────────────────────────────
+                    st.divider()
+                    with st.expander("💰 Expense Tracker", expanded=False):
+                        with engine.connect() as conn2:
+                            expenses = conn2.execute(text("""
+                                SELECT te.id, te.day_number, te.category, te.description,
+                                       te.amount, u.firstname AS paid_by_name
+                                FROM trip_expenses te
+                                LEFT JOIN users u ON te.paid_by=u.id
+                                WHERE te.trip_id=:tid
+                                ORDER BY te.day_number, te.created_at
+                            """), {"tid": t.id}).fetchall()
+
+                        if expenses:
+                            total = sum(e.amount for e in expenses)
+                            cat_totals = {}
+                            for e in expenses:
+                                cat_totals[e.category] = cat_totals.get(e.category, 0) + e.amount
+                            st.metric("Total Trip Cost", f"${total:,.2f}")
+                            st.caption(" · ".join(f"{cat}: ${amt:,.2f}" for cat, amt in sorted(cat_totals.items())))
+                            st.divider()
+                            exp_days = {}
+                            for e in expenses:
+                                exp_days.setdefault(e.day_number or 0, []).append(e)
+                            for day_n, day_exps in sorted(exp_days.items()):
+                                label = f"Day {day_n}" if day_n else "General"
+                                st.markdown(f"**{label}**")
+                                for e in day_exps:
+                                    ec1, ec2, ec3 = st.columns([4, 2, 1])
+                                    ec1.caption(f"{e.category}: {e.description or '—'}")
+                                    ec2.caption(f"${e.amount:,.2f}" + (f" · {e.paid_by_name}" if e.paid_by_name else ""))
+                                    if editable and ec3.button("✕", key=f"del_exp_{e.id}"):
+                                        with engine.begin() as conn2:
+                                            conn2.execute(text("DELETE FROM trip_expenses WHERE id=:id"), {"id": e.id})
+                                        st.rerun()
+
+                        if editable:
+                            st.divider()
+                            st.caption("**Add expense:**")
+                            view_days_exp = date_range_days(t.start_date, t.end_date)
+                            ea1, ea2, ea3, ea4, ea5 = st.columns([2, 2, 2, 2, 1])
+                            exp_cat  = ea1.selectbox("Category", ["Food", "Gas", "Lodging", "Fees", "Gear", "Other"], key=f"exp_cat_{t.id}")
+                            exp_desc = ea2.text_input("Description", key=f"exp_desc_{t.id}")
+                            exp_amt  = ea3.number_input("Amount ($)", min_value=0.0, step=0.01, format="%.2f", key=f"exp_amt_{t.id}")
+                            exp_day  = ea4.selectbox("Day", [0] + [d[0] for d in view_days_exp],
+                                                     format_func=lambda d: "General" if d == 0 else f"Day {d}",
+                                                     key=f"exp_day_{t.id}")
+                            if ea5.button("Add", key=f"add_exp_{t.id}") and exp_amt > 0:
+                                with engine.begin() as conn2:
+                                    conn2.execute(text("""
+                                        INSERT INTO trip_expenses (trip_id, day_number, category, description, amount, paid_by)
+                                        VALUES (:tid, :day, :cat, :desc, :amt, :uid)
+                                    """), {"tid": t.id, "day": exp_day if exp_day else None,
+                                           "cat": exp_cat, "desc": exp_desc, "amt": exp_amt, "uid": current_uid})
+                                st.rerun()
+
+                    # ── PERMIT TRACKER ───────────────────────────────────────
+                    with st.expander("🎫 Permit Tracker", expanded=False):
+                        with engine.connect() as conn2:
+                            permits = conn2.execute(text("""
+                                SELECT tp2.id, tp2.permit_name, p.name AS park_name,
+                                       tp2.required_by, tp2.secured, tp2.notes
+                                FROM trip_permits tp2
+                                LEFT JOIN parks p ON tp2.park_id=p.id
+                                WHERE tp2.trip_id=:tid ORDER BY tp2.required_by NULLS LAST
+                            """), {"tid": t.id}).fetchall()
+
+                        if permits:
+                            for pm in permits:
+                                pm1, pm2, pm3 = st.columns([5, 2, 1])
+                                secured_icon = "✅" if pm.secured else "⏳"
+                                due = f" · due {pm.required_by}" if pm.required_by else ""
+                                pm1.markdown(f"{secured_icon} **{pm.permit_name}** — _{pm.park_name or 'General'}_{due}")
+                                if pm.notes:
+                                    pm1.caption(pm.notes)
+                                if pm2.button("✅ Mark Secured" if not pm.secured else "↩️ Mark Pending",
+                                              key=f"toggle_permit_{pm.id}"):
+                                    with engine.begin() as conn2:
+                                        conn2.execute(text("UPDATE trip_permits SET secured=:s WHERE id=:id"),
+                                                      {"s": not pm.secured, "id": pm.id})
+                                    st.rerun()
+                                if editable and pm3.button("✕", key=f"del_permit_{pm.id}"):
+                                    with engine.begin() as conn2:
+                                        conn2.execute(text("DELETE FROM trip_permits WHERE id=:id"), {"id": pm.id})
+                                    st.rerun()
+                        elif not editable:
+                            st.caption("No permits tracked for this trip.")
+
+                        if editable:
+                            st.divider()
+                            st.caption("**Add permit:**")
+                            with engine.connect() as conn2:
+                                tp_parks = get_trip_parks(conn2, t.id)
+                            pa1, pa2, pa3, pa4 = st.columns([3, 2, 2, 1])
+                            perm_name = pa1.text_input("Permit name", key=f"perm_name_{t.id}")
+                            perm_park_opts = {tp_r.park_name: tp_r.park_id for tp_r in tp_parks}
+                            perm_park = pa2.selectbox("Park", ["General"] + list(perm_park_opts.keys()), key=f"perm_park_{t.id}")
+                            perm_due  = pa3.date_input("Required by", value=None, key=f"perm_due_{t.id}")
+                            if pa4.button("Add", key=f"add_perm_{t.id}") and perm_name:
+                                with engine.begin() as conn2:
+                                    conn2.execute(text("""
+                                        INSERT INTO trip_permits (trip_id, park_id, permit_name, required_by)
+                                        VALUES (:tid, :pid, :name, :due)
+                                    """), {"tid": t.id,
+                                           "pid": perm_park_opts.get(perm_park) if perm_park != "General" else None,
+                                           "name": perm_name, "due": perm_due if perm_due else None})
+                                st.rerun()
+
+                    # ── RATING & REVIEW (past trips) ─────────────────────────
+                    if trip_end_d and trip_end_d < date.today() and editable:
+                        st.divider()
+                        st.markdown("**⭐ Rate & Review This Trip**")
+                        current_rating = t.rating or 0
+                        new_rating = st.select_slider(
+                            "Rating", options=[1, 2, 3, 4, 5],
+                            value=current_rating if current_rating > 0 else 3,
+                            format_func=lambda x: "⭐" * x,
+                            key=f"rating_{t.id}"
+                        )
+                        new_review = st.text_area("Write a review (optional)",
+                                                   value=t.review_text or "",
+                                                   placeholder="What made this trip memorable? Tips for others?",
+                                                   height=100, key=f"review_{t.id}")
+                        is_public_now = st.checkbox("🌐 Make this trip public in the community feed",
+                                                     value=bool(t.is_public), key=f"ispub_{t.id}")
+                        if st.button("💾 Save Rating & Review", key=f"save_rating_{t.id}"):
+                            with engine.begin() as conn2:
+                                conn2.execute(text("""
+                                    UPDATE trips SET rating=:r, review_text=:rv, is_public=:pub WHERE id=:tid
+                                """), {"r": new_rating, "rv": new_review.strip() or None,
+                                       "pub": is_public_now, "tid": t.id})
+                            st.success("Saved! ⭐")
+                            st.rerun()
+
+    # ─────────────────────────────────────────────
+    # PASSPORT TAB — Choropleth map + park grid
+    # ─────────────────────────────────────────────
+    with passport_tab:
+        import plotly.express as px
+        import plotly.graph_objects as go
+
+        st.header("🗺 National Park Passport")
+        st.caption("Track every park you've visited across the US.")
+
+        with engine.connect() as conn2:
+            visited_rows = conn2.execute(text("""
+                SELECT DISTINCT p.id, p.name, p.state, p.image_url
+                FROM parks p
+                JOIN trip_parks tpk ON p.id=tpk.park_id
+                JOIN trips t ON tpk.trip_id=t.id
+                JOIN trip_participants tp ON t.id=tp.trip_id
+                WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
+                ORDER BY p.state, p.name
+            """), {"uid": current_uid}).fetchall()
+
+            all_parks_pass = conn2.execute(text("SELECT id, name, state FROM parks ORDER BY state, name")).fetchall()
+
+        visited_ids = {r.id for r in visited_rows}
+        visited_states = list({r.state for r in visited_rows if r.state})
+
+        # ── Choropleth ───────────────────────────────────────────────────────
+        state_visit_count = {}
+        for r in visited_rows:
+            if r.state:
+                state_visit_count[r.state] = state_visit_count.get(r.state, 0) + 1
+
+        all_states = list({r.state for r in all_parks_pass if r.state})
+        fig = go.Figure(data=go.Choropleth(
+            locations=[s for s in all_states],
+            z=[state_visit_count.get(s, 0) for s in all_states],
+            locationmode='USA-states',
+            colorscale=[[0, '#e8f5e9'], [0.01, '#a5d6a7'], [0.5, '#388e3c'], [1.0, '#1b5e20']],
+            zmin=0,
+            colorbar=dict(title="Parks visited", thickness=15, len=0.5),
+            hovertemplate='<b>%{location}</b><br>Parks visited: %{z}<extra></extra>',
+        ))
+        fig.update_layout(
+            geo=dict(scope='usa', showlakes=True, lakecolor='lightblue',
+                     bgcolor='rgba(0,0,0,0)', landcolor='#f5f5f5'),
+            margin=dict(l=0, r=0, t=10, b=0),
+            height=380,
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Stats row
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Parks Visited", len(visited_ids))
+        s2.metric("States Explored", len(visited_states))
+        s3.metric("Total Parks", len(all_parks_pass))
+        st.progress(len(visited_ids) / max(len(all_parks_pass), 1),
+                    text=f"{len(visited_ids)} / {len(all_parks_pass)} parks ({len(visited_ids)/max(len(all_parks_pass),1)*100:.0f}%)")
+
+        st.divider()
+
+        # ── Park grid ────────────────────────────────────────────────────────
+        tab_vis, tab_unvis = st.tabs([f"✅ Visited ({len(visited_ids)})", f"🔲 Not Yet ({len(all_parks_pass)-len(visited_ids)})"])
+        with tab_vis:
+            if not visited_rows:
+                st.info("No parks visited yet — plan your first trip!")
+            else:
+                for i in range(0, len(visited_rows), 4):
+                    cols = st.columns(4)
+                    for col, row in zip(cols, visited_rows[i:i+4]):
+                        with col:
+                            with st.container(border=True):
+                                if row.image_url:
+                                    st.image(row.image_url, use_container_width=True)
+                                st.caption(f"✅ **{row.name}**")
+                                st.caption(f"📍 {row.state}")
+        with tab_unvis:
+            unvisited = [r for r in all_parks_pass if r.id not in visited_ids]
+            for i in range(0, len(unvisited), 4):
+                cols = st.columns(4)
+                for col, row in zip(cols, unvisited[i:i+4]):
+                    with col:
+                        st.caption(f"🔲 **{row.name}**  \n📍 {row.state}")
+
+    # ─────────────────────────────────────────────
+    # DISCOVER TAB — Public feed + Friend feed + Park Recommendations + Challenges
+    # ─────────────────────────────────────────────
+    with discover_tab:
+        st.header("🌍 Discover")
+        disc_tab1, disc_tab2, disc_tab3, disc_tab4 = st.tabs([
+            "🌐 Public Trips", "👥 Friend Activity", "💡 Recommended Parks", "🏆 Challenges"
+        ])
+
+        # ── PUBLIC TRIP FEED ────────────────────────────────────────────────
+        with disc_tab1:
+            st.subheader("🌐 Community Trip Feed")
+            st.caption("Trips marked public by the community. Get inspired!")
+
+            with engine.connect() as conn2:
+                pub_trips = conn2.execute(text("""
+                    SELECT t.id, t.trip_name, t.start_date, t.end_date,
+                           t.rating, t.review_text,
+                           u.firstname, u.lastname, u.username,
+                           STRING_AGG(DISTINCT p.name, ', ' ORDER BY p.name) AS park_names,
+                           STRING_AGG(DISTINCT p.image_url, '|' ORDER BY p.image_url) AS park_images
+                    FROM trips t
+                    JOIN users u ON t.owner_id=u.id
+                    LEFT JOIN trip_parks tpk ON t.id=tpk.trip_id
+                    LEFT JOIN parks p ON tpk.park_id=p.id
+                    WHERE t.is_public=TRUE AND t.owner_id!=:uid
+                      AND (t.is_template IS NULL OR t.is_template=FALSE)
+                    GROUP BY t.id, t.trip_name, t.start_date, t.end_date,
+                             t.rating, t.review_text, u.firstname, u.lastname, u.username
+                    ORDER BY t.end_date DESC NULLS LAST
+                    LIMIT 30
+                """), {"uid": current_uid}).fetchall()
+
+            if not pub_trips:
+                st.info("No public trips yet. Be the first — mark one of your completed trips as public in My Trips!")
+            else:
+                for pt in pub_trips:
+                    with st.container(border=True):
+                        imgs = [i for i in (pt.park_images or "").split("|") if i]
+                        if imgs:
+                            st.image(imgs[0], use_container_width=True)
+                        stars = "⭐" * (pt.rating or 0)
+                        st.markdown(f"**{pt.trip_name}** {stars}")
+                        st.caption(f"👤 {pt.firstname} {pt.lastname} (@{pt.username})  •  📅 {pt.start_date} → {pt.end_date}")
+                        st.caption(f"🏔️ {pt.park_names or 'Parks not listed'}")
+                        if pt.review_text:
+                            st.markdown(f"> {pt.review_text}")
+                        # Inspire button
+                        if st.button("✨ Use as Inspiration", key=f"inspire_{pt.id}"):
+                            with engine.connect() as conn2:
+                                inspire_parks = conn2.execute(text("""
+                                    SELECT p.name FROM trip_parks tpk
+                                    JOIN parks p ON tpk.park_id=p.id WHERE tpk.trip_id=:tid
+                                """), {"tid": pt.id}).fetchall()
+                            st.session_state["selected_parks"] = [r.name for r in inspire_parks]
+                            st.session_state.active_parks_saved = [r.name for r in inspire_parks]
+                            st.success("Parks loaded! Switch to Plan Trip to continue.")
+
+        # ── FRIEND ACTIVITY FEED ────────────────────────────────────────────
+        with disc_tab2:
+            st.subheader("👥 Friend Activity")
+            with engine.connect() as conn2:
+                friend_activity = conn2.execute(text("""
+                    SELECT t.id, t.trip_name, t.start_date, t.end_date,
+                           u.firstname, u.lastname,
+                           STRING_AGG(DISTINCT p.name, ', ' ORDER BY p.name) AS park_names,
+                           STRING_AGG(DISTINCT p.image_url, '|' ORDER BY p.image_url) AS park_images,
+                           tp_owner.role,
+                           t.rating
+                    FROM trips t
+                    JOIN trip_participants tp_owner ON t.id=tp_owner.trip_id AND tp_owner.role='owner'
+                    JOIN users u ON tp_owner.user_id=u.id
+                    LEFT JOIN trip_parks tpk ON t.id=tpk.trip_id
+                    LEFT JOIN parks p ON tpk.park_id=p.id
+                    WHERE tp_owner.user_id IN (
+                        SELECT CASE WHEN f.user_id=:uid THEN f.friend_id ELSE f.user_id END
+                        FROM friendships f WHERE (f.user_id=:uid OR f.friend_id=:uid) AND f.status='accepted'
+                    )
+                    AND (t.is_template IS NULL OR t.is_template=FALSE)
+                    AND tp_owner.invitation_status='accepted'
+                    GROUP BY t.id, t.trip_name, t.start_date, t.end_date,
+                             u.firstname, u.lastname, tp_owner.role, t.rating
+                    ORDER BY t.start_date DESC NULLS LAST
+                    LIMIT 20
+                """), {"uid": current_uid}).fetchall()
+
+            if not friend_activity:
+                st.info("Add friends to see their trips here!")
+            else:
+                for fa in friend_activity:
+                    with st.container(border=True):
+                        imgs = [i for i in (fa.park_images or "").split("|") if i]
+                        if imgs:
+                            st.image(imgs[0], use_container_width=True)
+                        status_e, status_l, _ = trip_status(fa.start_date, fa.end_date)
+                        stars = "⭐" * (fa.rating or 0)
+                        st.markdown(f"**{fa.trip_name}** {stars}  {status_e} _{status_l}_")
+                        st.caption(f"👤 {fa.firstname} {fa.lastname}  •  🏔️ {fa.park_names or '—'}")
+                        st.caption(f"📅 {fa.start_date} → {fa.end_date}")
+
+        # ── PARK RECOMMENDATIONS ────────────────────────────────────────────
+        with disc_tab3:
+            st.subheader("💡 Parks You Might Love")
+            st.caption("Based on the parks you've already visited.")
+
+            with engine.connect() as conn2:
+                visited_park_ids_rec = [r[0] for r in conn2.execute(text("""
+                    SELECT DISTINCT tpk.park_id FROM trip_parks tpk
+                    JOIN trips t ON tpk.trip_id=t.id
+                    JOIN trip_participants tp ON t.id=tp.trip_id
+                    WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
+                """), {"uid": current_uid}).fetchall()]
+
+                visited_states_rec = [r[0] for r in conn2.execute(text("""
+                    SELECT DISTINCT p.state FROM parks p
+                    JOIN trip_parks tpk ON p.id=tpk.park_id
+                    JOIN trips t ON tpk.trip_id=t.id
+                    JOIN trip_participants tp ON t.id=tp.trip_id
+                    WHERE tp.user_id=:uid AND tp.invitation_status='accepted' AND p.state IS NOT NULL
+                """), {"uid": current_uid}).fetchall()]
+
+            if not visited_park_ids_rec:
+                st.info("Visit some parks first and we'll recommend similar ones!")
+            else:
+                # Recommend parks in states the user has visited but hasn't seen yet
+                with engine.connect() as conn2:
+                    if visited_states_rec:
+                        recs = conn2.execute(text("""
+                            SELECT p.id, p.name, p.state, p.image_url,
+                                   pd.description, pd.entrance_fee_cost
+                            FROM parks p
+                            LEFT JOIN park_details pd ON p.id=pd.park_id
+                            WHERE p.id NOT IN :visited
+                              AND p.state IN :states
+                            ORDER BY p.name LIMIT 9
+                        """), {"visited": tuple(visited_park_ids_rec) or (0,),
+                               "states": tuple(visited_states_rec)}).fetchall()
+                    else:
+                        recs = []
+
+                    # Fill up to 9 with popular parks not yet visited
+                    if len(recs) < 9:
+                        already = {r.id for r in recs} | set(visited_park_ids_rec)
+                        extra = conn2.execute(text("""
+                            SELECT p.id, p.name, p.state, p.image_url,
+                                   pd.description, pd.entrance_fee_cost
+                            FROM parks p
+                            LEFT JOIN park_details pd ON p.id=pd.park_id
+                            WHERE p.id NOT IN :excl
+                            ORDER BY p.name LIMIT :lim
+                        """), {"excl": tuple(already) or (0,), "lim": 9 - len(recs)}).fetchall()
+                        recs = list(recs) + list(extra)
+
+                for i in range(0, len(recs), 3):
+                    cols = st.columns(3)
+                    for col, r in zip(cols, recs[i:i+3]):
+                        with col:
+                            with st.container(border=True):
+                                if r.image_url:
+                                    st.image(r.image_url, use_container_width=True)
+                                st.markdown(f"**{r.name}**")
+                                st.caption(f"📍 {r.state}")
+                                if r.description:
+                                    st.caption(str(r.description)[:150] + "...")
+                                if r.entrance_fee_cost:
+                                    st.caption(f"💵 ${r.entrance_fee_cost}")
+                                if st.button("Plan a trip here", key=f"rec_plan_{r.id}"):
+                                    st.session_state["selected_parks"] = [r.name]
+                                    st.session_state.active_parks_saved = [r.name]
+                                    st.success(f"Loaded {r.name}! Switch to Plan Trip.")
+
+        # ── CHALLENGES ──────────────────────────────────────────────────────
+        with disc_tab4:
+            st.subheader("🏆 Bucket List Challenges")
+
+            with engine.connect() as conn2:
+                all_challenges = conn2.execute(text("""
+                    SELECT c.*, ucp.completed, ucp.completed_at
+                    FROM challenges c
+                    LEFT JOIN user_challenge_progress ucp
+                      ON c.id=ucp.challenge_id AND ucp.user_id=:uid
+                    ORDER BY c.sort_order
+                """), {"uid": current_uid}).fetchall()
+
+                user_visited_ids = set(r[0] for r in conn2.execute(text("""
+                    SELECT DISTINCT tpk.park_id FROM trip_parks tpk
+                    JOIN trips t ON tpk.trip_id=t.id
+                    JOIN trip_participants tp ON t.id=tp.trip_id
+                    WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
+                """), {"uid": current_uid}).fetchall())
+
+                user_visited_states = set(r[0] for r in conn2.execute(text("""
+                    SELECT DISTINCT p.state FROM parks p
+                    JOIN trip_parks tpk ON p.id=tpk.park_id
+                    JOIN trips t ON tpk.trip_id=t.id
+                    JOIN trip_participants tp ON t.id=tp.trip_id
+                    WHERE tp.user_id=:uid AND tp.invitation_status='accepted' AND p.state IS NOT NULL
+                """), {"uid": current_uid}).fetchall())
+
+            def check_challenge_progress(c):
+                """Return (completed_count, total_needed) for a challenge."""
+                if c.required_park_ids:
+                    done = sum(1 for pid in c.required_park_ids if pid in user_visited_ids)
+                    return done, len(c.required_park_ids)
+                if c.required_states and c.required_count:
+                    done = sum(1 for s in c.required_states if s in user_visited_states)
+                    return done, c.required_count
+                if c.required_count:
+                    return min(len(user_visited_ids), c.required_count), c.required_count
+                return 0, 1
+
+            # Auto-complete newly finished challenges
+            for c in all_challenges:
+                done, total = check_challenge_progress(c)
+                if done >= total and not c.completed:
+                    with engine.begin() as conn2:
+                        conn2.execute(text("""
+                            INSERT INTO user_challenge_progress (user_id, challenge_id, completed, completed_at)
+                            VALUES (:uid, :cid, TRUE, NOW())
+                            ON CONFLICT (user_id, challenge_id) DO UPDATE
+                              SET completed=TRUE, completed_at=NOW()
+                        """), {"uid": current_uid, "cid": c.id})
+                    st.toast(f"🏆 Challenge complete: {c.icon} {c.name}!", icon="🎉")
+
+            completed_chall = [c for c in all_challenges if c.completed]
+            in_progress = [c for c in all_challenges if not c.completed]
+
+            st.caption(f"**{len(completed_chall)}/{len(all_challenges)}** challenges completed")
+            st.progress(len(completed_chall) / max(len(all_challenges), 1))
+
+            st.markdown("**In Progress:**")
+            for c in in_progress:
+                done, total = check_challenge_progress(c)
+                with st.container(border=True):
+                    c1, c2 = st.columns([3, 1])
+                    c1.markdown(f"{c.icon} **{c.name}**")
+                    c1.caption(c.description)
+                    c2.metric("Progress", f"{done}/{total}")
+                    st.progress(done / max(total, 1))
+
+            if completed_chall:
+                st.markdown("**Completed 🎉:**")
+                for c in completed_chall:
+                    with st.container(border=True):
+                        ts = c.completed_at.strftime("%b %d, %Y") if c.completed_at and hasattr(c.completed_at, 'strftime') else ""
+                        st.markdown(f"{c.icon} ~~{c.name}~~ ✅  \n_{c.description}_  \n<small>Completed {ts}</small>", unsafe_allow_html=True)
+
+    # ─────────────────────────────────────────────
+    # GEAR TEMPLATES TAB
+    # ─────────────────────────────────────────────
+    with gear_tab:
+        st.header("🎒 Gear Templates")
+        st.caption("Save reusable packing lists. Apply them to any trip.")
+
+        gt_list_tab, gt_create_tab, gt_community_tab = st.tabs(["My Templates", "Create New", "Community Templates"])
+
+        with gt_list_tab:
+            with engine.connect() as conn2:
+                my_templates = conn2.execute(text("""
+                    SELECT gt.id, gt.template_name, gt.is_public,
+                           COUNT(gti.id) AS item_count
+                    FROM gear_templates gt
+                    LEFT JOIN gear_template_items gti ON gt.id=gti.template_id
+                    WHERE gt.user_id=:uid
+                    GROUP BY gt.id, gt.template_name, gt.is_public
+                    ORDER BY gt.template_name
+                """), {"uid": current_uid}).fetchall()
+
+            if not my_templates:
+                st.info("No gear templates yet. Create one in the 'Create New' tab, or let AI generate one when you save a trip!")
+            else:
+                for gt in my_templates:
+                    with st.expander(f"{'🌐' if gt.is_public else '🔒'} {gt.template_name}  ·  {gt.item_count} items"):
+                        with engine.connect() as conn2:
+                            items = conn2.execute(text("""
+                                SELECT id, category, item_name FROM gear_template_items
+                                WHERE template_id=:tid ORDER BY category, item_name
+                            """), {"tid": gt.id}).fetchall()
+
+                        cats = {}
+                        for item in items:
+                            cats.setdefault(item.category or "General", []).append(item)
+
+                        ic1, ic2 = st.columns(2)
+                        for ci, (cat, citems) in enumerate(sorted(cats.items())):
+                            with (ic1 if ci % 2 == 0 else ic2):
+                                st.markdown(f"**{cat}**")
+                                for it in citems:
+                                    del_col, name_col = st.columns([1, 8])
+                                    name_col.caption(f"• {it.item_name}")
+                                    if del_col.button("✕", key=f"del_gti_{it.id}", help="Remove item"):
+                                        with engine.begin() as conn2:
+                                            conn2.execute(text("DELETE FROM gear_template_items WHERE id=:id"), {"id": it.id})
+                                        st.rerun()
+
+                        # Add item inline
+                        st.divider()
+                        ai1, ai2, ai3 = st.columns([3, 2, 1])
+                        new_item_name = ai1.text_input("Item", key=f"new_gti_name_{gt.id}")
+                        new_item_cat  = ai2.selectbox("Category", ["Clothing", "Footwear", "Navigation", "Safety",
+                            "Camping/Shelter", "Food & Water", "Photography", "Personal Care", "Documents", "Other"],
+                            key=f"new_gti_cat_{gt.id}")
+                        if ai3.button("Add", key=f"add_gti_{gt.id}") and new_item_name:
+                            with engine.begin() as conn2:
+                                conn2.execute(text("INSERT INTO gear_template_items (template_id, category, item_name) VALUES (:tid,:cat,:item)"),
+                                              {"tid": gt.id, "cat": new_item_cat, "item": new_item_name})
+                            st.rerun()
+
+                        st.divider()
+                        pub_col, del_col2 = st.columns(2)
+                        if pub_col.button("🌐 Make Public" if not gt.is_public else "🔒 Make Private", key=f"toggle_pub_gt_{gt.id}"):
+                            with engine.begin() as conn2:
+                                conn2.execute(text("UPDATE gear_templates SET is_public=:p WHERE id=:id"),
+                                              {"p": not gt.is_public, "id": gt.id})
+                            st.rerun()
+                        if del_col2.button("🗑️ Delete Template", key=f"del_gt_{gt.id}"):
+                            with engine.begin() as conn2:
+                                conn2.execute(text("DELETE FROM gear_templates WHERE id=:id"), {"id": gt.id})
+                            st.rerun()
+
+        with gt_create_tab:
+            st.markdown("**Create a new gear template**")
+            new_gt_name = st.text_input("Template name (e.g. 'My Car Camping Kit')", key="new_gt_name")
+            new_gt_public = st.checkbox("Make public so others can use it", key="new_gt_public")
+
+            ai_gen_col, manual_col = st.columns(2)
+            with ai_gen_col:
+                st.markdown("**✨ AI Generate**")
+                ai_trip_type = st.text_input("Describe the trip type (e.g. '3-day desert backpacking')", key="gt_ai_desc")
+                if st.button("Generate with AI", use_container_width=True) and new_gt_name and ai_trip_type:
+                    with st.spinner("Building your kit..."):
+                        items = generate_packing_list([ai_trip_type], [], 3)
+                    if items:
+                        with engine.begin() as conn2:
+                            gt_id = conn2.execute(text("""
+                                INSERT INTO gear_templates (user_id, template_name, is_public)
+                                VALUES (:uid,:name,:pub) RETURNING id
+                            """), {"uid": current_uid, "name": new_gt_name, "pub": new_gt_public}).scalar()
+                            for item in items:
+                                conn2.execute(text("INSERT INTO gear_template_items (template_id, category, item_name) VALUES (:tid,:cat,:item)"),
+                                              {"tid": gt_id, "cat": item.get("category","General"), "item": item.get("item","")})
+                        st.success(f"Template '{new_gt_name}' created with {len(items)} items!")
+                        st.rerun()
+
+            with manual_col:
+                st.markdown("**📝 Create Empty**")
+                st.caption("Create a blank template and add items manually.")
+                if st.button("Create Empty Template", use_container_width=True) and new_gt_name:
+                    with engine.begin() as conn2:
+                        conn2.execute(text("INSERT INTO gear_templates (user_id, template_name, is_public) VALUES (:uid,:name,:pub)"),
+                                      {"uid": current_uid, "name": new_gt_name, "pub": new_gt_public})
+                    st.success(f"Template '{new_gt_name}' created!")
+                    st.rerun()
+
+        with gt_community_tab:
+            st.markdown("**Community Gear Templates**")
+            with engine.connect() as conn2:
+                pub_templates = conn2.execute(text("""
+                    SELECT gt.id, gt.template_name, u.firstname, u.lastname,
+                           COUNT(gti.id) AS item_count
+                    FROM gear_templates gt
+                    JOIN users u ON gt.user_id=u.id
+                    LEFT JOIN gear_template_items gti ON gt.id=gti.template_id
+                    WHERE gt.is_public=TRUE AND gt.user_id!=:uid
+                    GROUP BY gt.id, gt.template_name, u.firstname, u.lastname
+                    ORDER BY item_count DESC LIMIT 20
+                """), {"uid": current_uid}).fetchall()
+
+            if not pub_templates:
+                st.info("No community templates yet.")
+            else:
+                for pt in pub_templates:
+                    with st.expander(f"**{pt.template_name}** by {pt.firstname} {pt.lastname}  ·  {pt.item_count} items"):
+                        with engine.connect() as conn2:
+                            items = conn2.execute(text("""
+                                SELECT category, item_name FROM gear_template_items
+                                WHERE template_id=:tid ORDER BY category, item_name
+                            """), {"tid": pt.id}).fetchall()
+                        cats = {}
+                        for item in items:
+                            cats.setdefault(item.category or "General", []).append(item.item_name)
+                        cc1, cc2 = st.columns(2)
+                        for ci, (cat, names) in enumerate(sorted(cats.items())):
+                            with (cc1 if ci % 2 == 0 else cc2):
+                                st.markdown(f"**{cat}**")
+                                for n in names:
+                                    st.caption(f"• {n}")
+                        if st.button("📋 Copy to My Templates", key=f"copy_gt_{pt.id}"):
+                            with engine.begin() as conn2:
+                                new_id = conn2.execute(text("""
+                                    INSERT INTO gear_templates (user_id, template_name, is_public)
+                                    VALUES (:uid, :name, FALSE) RETURNING id
+                                """), {"uid": current_uid, "name": f"{pt.template_name} (copy)"}).scalar()
+                                conn2.execute(text("""
+                                    INSERT INTO gear_template_items (template_id, category, item_name)
+                                    SELECT :new_id, category, item_name FROM gear_template_items WHERE template_id=:old_id
+                                """), {"new_id": new_id, "old_id": pt.id})
+                            st.success("Copied to your templates!")
+                            st.rerun()
