@@ -223,7 +223,7 @@ Respond ONLY as a JSON array, no markdown, no extra text. Each element:
 {{"from": "...", "to": "...", "drive_time": "e.g. 3h 20min", "distance_miles": 210, "tip": "one short travel tip"}}
 Pairs:\n{pair_text}"""
     try:
-        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text
+        resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text
         return json.loads(re.sub(r"```json|```", "", resp).strip())
     except Exception:
         return []
@@ -237,7 +237,7 @@ Respond ONLY as a JSON array, no markdown, no extra text. Each element:
 {{"category": "e.g. Clothing", "item": "e.g. Moisture-wicking shirt x3"}}
 Include 25-35 items across: Clothing, Footwear, Navigation, Safety, Camping/Shelter, Food & Water, Photography, Personal Care, Documents."""
     try:
-        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text
+        resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text
         return json.loads(re.sub(r"```json|```", "", resp).strip())
     except Exception:
         return []
@@ -258,7 +258,7 @@ Journal notes from the trip:
 
 Write 3-4 paragraphs in a warm, storytelling style — like a travel journal entry. Mention specific activities and any notes. End with a memorable closing line."""
     try:
-        return client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text.strip()
+        return client.models.generate_content(model="gemini-2.0-flash", contents=prompt).text.strip()
     except Exception:
         return ""
 
@@ -544,7 +544,7 @@ if not st.session_state.logged_in:
         st.subheader("🔑 Reset your password")
         st.caption("Enter your username and date of birth. Your password will be reset to your DOB (MMDDYYYY) and you'll be prompted to change it on login.")
         reset_u   = st.text_input("Username").strip().lower()
-        reset_dob = st.date_input("Date of Birth", min_value=date(1900, 1, 1), max_value=date.today(), value=None)
+        reset_dob = st.date_input("Date of Birth", min_value=date(1900, 1, 1), max_value=date.today(), value=None, format="MM/DD/YYYY")
         if st.button("Reset Password", use_container_width=True):
             if not reset_u or not reset_dob:
                 st.error("Please fill in both fields.")
@@ -584,7 +584,7 @@ if not st.session_state.logged_in:
         ln  = st.text_input("Last Name")
         em  = st.text_input("Email")
         dob = st.date_input("Date of Birth", min_value=date(1900, 1, 1), max_value=date.today(), value=None,
-                             help="Used to reset your password if you forget it")
+                             help="Used to reset your password if you forget it", format="MM/DD/YYYY")
         lk  = st.text_area("Travel Style / Interests")
         pw1 = st.text_input("Password", type="password", key="su_pw1")
         pw2 = st.text_input("Confirm Password", type="password", key="su_pw2")
@@ -688,12 +688,26 @@ else:
             new_lastname  = st.text_input("Last Name",  value=st.session_state.user_info.get("lastname",  ""), key="profile_lastname")
             new_email     = st.text_input("Email",      value=st.session_state.user_info.get("email",     ""), key="profile_email")
             new_likes     = st.text_area("Travel Style / Interests", value=st.session_state.user_info.get("likes", ""), key="profile_likes", height=100)
+
+            # Load current DOB from DB to pre-populate
+            with engine.connect() as conn:
+                dob_row = conn.execute(text("SELECT date_of_birth FROM users WHERE id=:uid"), {"uid": current_uid}).fetchone()
+            current_dob = dob_row.date_of_birth if dob_row and dob_row.date_of_birth else None
+            if current_dob and not isinstance(current_dob, date):
+                current_dob = current_dob.date() if hasattr(current_dob, 'date') else None
+            dob_display = current_dob.strftime("%m/%d/%Y") if current_dob else "Not set"
+            st.caption(f"🎂 Date of Birth: **{dob_display}** _(used for password reset)_")
+            new_dob = st.date_input("Update Date of Birth", value=current_dob,
+                                    min_value=date(1900, 1, 1), max_value=date.today(),
+                                    key="profile_dob", format="MM/DD/YYYY")
+
             if st.button("💾 Save Profile", use_container_width=True):
                 try:
                     with engine.begin() as conn:
                         conn.execute(text("""
-                            UPDATE users SET firstname=:fn, lastname=:ln, email=:em, likes=:lk WHERE id=:uid
-                        """), {"fn": new_firstname, "ln": new_lastname, "em": new_email, "lk": new_likes, "uid": current_uid})
+                            UPDATE users SET firstname=:fn, lastname=:ln, email=:em, likes=:lk, date_of_birth=:dob WHERE id=:uid
+                        """), {"fn": new_firstname, "ln": new_lastname, "em": new_email, "lk": new_likes,
+                               "dob": new_dob if new_dob else current_dob, "uid": current_uid})
                     st.session_state.user_info.update({"firstname": new_firstname, "lastname": new_lastname, "email": new_email, "likes": new_likes})
                     st.success("Profile updated!")
                 except Exception as e:
@@ -1171,22 +1185,39 @@ else:
                 itinerary_context = (f"a {nights}-night trip at {selected_parks[0]}" if len(selected_parks) == 1
                                      else f"a {nights}-night multi-park trip visiting {parks_label}. Distribute days across parks logically.")
 
-                prompt = f"""
-Suggest 12 individual activities spread across {parks_context}.
+                prompt = f"""Trip context: {itinerary_context}
 {group_note}
-Format each as: Name | Type | Park | Brief description
-Only return the list, one activity per line.
 
----MASTER_ITINERARY---
-Provide a full day-by-day itinerary for {itinerary_context}.
-{group_note}
-Label each day clearly as "Day 1", "Day 2", etc. and list the specific activities under each day.
+You must respond in EXACTLY two sections. The sections are separated by the token <<<ITINERARY_SPLIT>>> on its own line. Do not omit or alter this token.
+
+SECTION 1 — output ONLY 12 lines, each in this exact format (no headers, no blank lines, no other text):
+Activity Name | Activity Type | Park Name | Brief description
+Activity Name | Activity Type | Park Name | Brief description
+(12 lines total, every line must contain exactly 3 pipe characters)
+
+<<<ITINERARY_SPLIT>>>
+
+SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc. List activities under each day.
 """
                 with st.spinner("Scouting the trail..."):
                     resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text
-                    parts = resp.split('---MASTER_ITINERARY---')
-                    st.session_state.temp_activities = [l for l in parts[0].strip().split('\n') if "|" in l]
-                    st.session_state.master_itinerary = parts[1].strip() if len(parts) > 1 else ""
+                    split_token = "<<<ITINERARY_SPLIT>>>"
+                    if split_token in resp:
+                        raw_acts, raw_itinerary = resp.split(split_token, 1)
+                    else:
+                        # Fallback: lines with 3+ pipes are activities, rest is itinerary
+                        lines = resp.strip().split('\n')
+                        act_lines   = [l for l in lines if l.count('|') >= 3]
+                        other_lines = [l for l in lines if l.count('|') < 3]
+                        raw_acts      = '\n'.join(act_lines)
+                        raw_itinerary = '\n'.join(other_lines)
+
+                    # Only keep lines that look like valid activity rows (exactly 3 pipes)
+                    st.session_state.temp_activities = [
+                        l.strip() for l in raw_acts.strip().split('\n')
+                        if l.strip() and l.count('|') >= 3
+                    ]
+                    st.session_state.master_itinerary = raw_itinerary.strip()
 
                     num_days = nights + 1
                     day_map = parse_activity_day_defaults(st.session_state.master_itinerary, num_days)
