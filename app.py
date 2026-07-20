@@ -1446,7 +1446,7 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                        STRING_AGG(DISTINCT p.name, ', ' ORDER BY p.name) AS park_names,
                        STRING_AGG(DISTINCT p.image_url, '|' ORDER BY p.image_url) AS park_images,
                        u_owner.firstname || ' ' || u_owner.lastname AS owner_name,
-                       tp.role, t.recap_text
+                       tp.role, t.recap_text, t.rating, t.review_text, t.is_public
                 FROM trips t
                 JOIN trip_participants tp ON t.id=tp.trip_id
                 JOIN users u_owner ON t.owner_id=u_owner.id
@@ -1454,7 +1454,7 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                 LEFT JOIN parks p ON tpk.park_id=p.id
                 WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
                   AND (t.is_template IS NULL OR t.is_template=FALSE)
-                GROUP BY t.id, t.trip_name, t.start_date, t.end_date, u_owner.firstname, u_owner.lastname, tp.role, t.recap_text
+                GROUP BY t.id, t.trip_name, t.start_date, t.end_date, u_owner.firstname, u_owner.lastname, tp.role, t.recap_text, t.rating, t.review_text, t.is_public
                 ORDER BY t.start_date DESC
             """), {"uid": current_uid}).fetchall()
             all_parks = pd.read_sql(text("SELECT name, id FROM parks ORDER BY name"), conn)
