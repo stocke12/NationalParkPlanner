@@ -37,9 +37,9 @@ for key, val in {
     "park_distances": [],
     "conflict_warnings": {},
     "active_parks_saved": [],
-    # auth flow state
-    "auth_screen": "login",  # login | set_password | force_change | reset | signup
-    "pending_uid": None,     # user id mid-flow
+    "auth_screen": "login",
+    "pending_uid": None,
+    "badges_checked_session": False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = val
@@ -51,14 +51,57 @@ def get_engine():
 engine = get_engine()
 
 # ─────────────────────────────────────────────
+# CACHED / SHARED READS
+# ─────────────────────────────────────────────
+# These queries rarely change between reruns, so instead of hitting the DB
+# on every widget interaction (Streamlit reruns the WHOLE script top to
+# bottom on every click, in every tab, not just the one you touched), we
+# cache them for a short TTL and re-derive per-user bits (wishlist, role,
+# etc.) separately and cheaply.
+
+@st.cache_data(ttl=600)
+def get_parks_with_details():
+    """Static-ish park catalogue + details. Cached — this almost never changes."""
+    with engine.connect() as conn:
+        return pd.read_sql(text("""
+            SELECT p.id, p.name, p.state, p.image_url,
+                   pd.description, pd.entrance_fee_cost, pd.visitor_center_hours,
+                   pd.weather_info, pd.activities, pd.latitude, pd.longitude
+            FROM parks p
+            LEFT JOIN park_details pd ON p.id = pd.park_id
+            ORDER BY p.name
+        """), conn)
+
+@st.cache_data(ttl=60)
+def get_active_alerts_map():
+    with engine.connect() as conn:
+        df = pd.read_sql(text("""
+            SELECT park_id, COUNT(*) AS alert_count FROM alerts WHERE isactive=TRUE GROUP BY park_id
+        """), conn)
+    return dict(zip(df['park_id'], df['alert_count'])) if not df.empty else {}
+
+@st.cache_data(ttl=600)
+def get_park_name_id_df():
+    with engine.connect() as conn:
+        return pd.read_sql(text("SELECT name, id, state FROM parks ORDER BY name"), conn)
+
+@st.cache_data(ttl=600)
+def get_challenge_definitions():
+    with engine.connect() as conn:
+        return conn.execute(text("SELECT * FROM challenges ORDER BY sort_order")).fetchall()
+
+def mark_badges_dirty():
+    """Call after any action that could earn a badge (trip saved, friend added, etc.)."""
+    st.session_state["badges_checked_session"] = False
+
+# ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
 
 def trip_status(start_d, end_d):
-    """Return (emoji, label, color) for a trip based on today's date."""
     today = date.today()
     s = start_d if isinstance(start_d, date) else date.fromisoformat(str(start_d)) if start_d else None
-    e = end_d   if isinstance(end_d,   date) else date.fromisoformat(str(end_d))   if end_d   else None
+    e = end_d if isinstance(end_d, date) else date.fromisoformat(str(end_d)) if end_d else None
     if not s or not e:
         return ("📅", "Upcoming", "gray")
     if today < s:
@@ -280,6 +323,8 @@ BADGE_DEFINITIONS = [
 ]
 
 def compute_and_award_badges(uid):
+    """Runs ~7 queries. Only call this when something badge-relevant happened —
+    not on every rerun (see mark_badges_dirty / badges_checked_session)."""
     with engine.connect() as conn:
         trip_count = conn.execute(text("""
             SELECT COUNT(*) FROM trips t JOIN trip_participants tp ON t.id=tp.trip_id
@@ -460,6 +505,94 @@ def render_dnd_itinerary(day_activities, days, editable=True, conflict_warnings=
     result = st.components.v1.html(html, height=max(300, len(days) * 60 + 100), scrolling=False)
     return result
 
+# ─────────────────────────────────────────────
+# LAZY TRIP-DETAIL LOADER  (the big perf fix for My Trips)
+# ─────────────────────────────────────────────
+# Previously, every one of these ~9 queries ran for every trip on every
+# single rerun anywhere in the app. Now we fetch once, cache the result in
+# session_state, and only re-fetch when this trip's own data actually
+# changes (note added, expense added, etc.) via invalidate_trip_data().
+
+def load_trip_heavy_data(tid, start_d):
+    with engine.connect() as conn:
+        saved_acts = conn.execute(text("""
+            SELECT id, day_number, activity_name, activity_type, sort_order
+            FROM trip_activities WHERE trip_id=:tid ORDER BY day_number, sort_order
+        """), {"tid": tid}).fetchall()
+
+        all_notes_rows = conn.execute(text("""
+            SELECT tdn.id, tdn.day_number, tdn.note_text, tdn.created_at,
+                   u.firstname, u.lastname, tdn.author_id
+            FROM trip_day_notes tdn JOIN users u ON tdn.author_id=u.id
+            WHERE tdn.trip_id=:tid ORDER BY tdn.day_number, tdn.created_at
+        """), {"tid": tid}).fetchall()
+
+        trip_parks_rows = get_trip_parks(conn, tid)
+        park_ids = [tp.park_id for tp in trip_parks_rows]
+
+        trip_alerts, crowd_rows, warn_rows = [], [], []
+        if park_ids:
+            trip_alerts = conn.execute(text("""
+                SELECT a.title, a.category, a.description, p.name AS park_name
+                FROM alerts a JOIN parks p ON a.park_id=p.id
+                WHERE a.park_id=ANY(:pids) AND a.isactive=TRUE
+                ORDER BY p.name, a.category
+            """), {"pids": park_ids}).fetchall()
+
+            trip_month = start_d.month if start_d else None
+            if trip_month:
+                crowd_rows = conn.execute(text("""
+                    SELECT p.name AS park_name, pcc.crowd_level, pcc.notes
+                    FROM park_crowd_calendar pcc JOIN parks p ON pcc.park_id=p.id
+                    WHERE pcc.park_id=ANY(:pids) AND pcc.month=:m ORDER BY p.name
+                """), {"pids": park_ids, "m": trip_month}).fetchall()
+                warn_rows = conn.execute(text("""
+                    SELECT p.name AS park_name, psw.warning_type, psw.description
+                    FROM park_seasonal_warnings psw JOIN parks p ON psw.park_id=p.id
+                    WHERE psw.park_id=ANY(:pids)
+                      AND ((psw.month_start <= psw.month_end AND :m BETWEEN psw.month_start AND psw.month_end)
+                           OR (psw.month_start > psw.month_end AND (:m >= psw.month_start OR :m <= psw.month_end)))
+                    ORDER BY p.name
+                """), {"pids": park_ids, "m": trip_month}).fetchall()
+
+        packing_rows = conn.execute(text("""
+            SELECT id, category, item_name, is_checked FROM trip_packing_items
+            WHERE trip_id=:tid ORDER BY category, item_name
+        """), {"tid": tid}).fetchall()
+
+        expenses = conn.execute(text("""
+            SELECT te.id, te.day_number, te.category, te.description, te.amount, u.firstname AS paid_by_name
+            FROM trip_expenses te LEFT JOIN users u ON te.paid_by=u.id
+            WHERE te.trip_id=:tid ORDER BY te.day_number, te.created_at
+        """), {"tid": tid}).fetchall()
+
+        permits = conn.execute(text("""
+            SELECT tp2.id, tp2.permit_name, p.name AS park_name, tp2.required_by, tp2.secured, tp2.notes
+            FROM trip_permits tp2 LEFT JOIN parks p ON tp2.park_id=p.id
+            WHERE tp2.trip_id=:tid ORDER BY tp2.required_by NULLS LAST
+        """), {"tid": tid}).fetchall()
+
+        participants = conn.execute(text("""
+            SELECT u.firstname, u.lastname, u.username, tp.role, tp.invitation_status
+            FROM trip_participants tp JOIN users u ON tp.user_id=u.id
+            WHERE tp.trip_id=:tid ORDER BY tp.role
+        """), {"tid": tid}).fetchall()
+
+    return {
+        "acts": saved_acts, "notes": all_notes_rows, "trip_parks": trip_parks_rows,
+        "alerts": trip_alerts, "crowd": crowd_rows, "warnings": warn_rows,
+        "packing": packing_rows, "expenses": expenses, "permits": permits,
+        "participants": participants,
+    }
+
+def get_trip_data(tid, start_d):
+    key = f"trip_data_{tid}"
+    if key not in st.session_state:
+        st.session_state[key] = load_trip_heavy_data(tid, start_d)
+    return st.session_state[key]
+
+def invalidate_trip_data(tid):
+    st.session_state.pop(f"trip_data_{tid}", None)
 
 # ─────────────────────────────────────────────
 # PASSWORD HELPERS
@@ -475,7 +608,6 @@ def check_password(plain: str, hashed: str) -> bool:
         return False
 
 def validate_password(pw: str) -> str | None:
-    """Return an error string if invalid, None if fine."""
     if len(pw) < 8:
         return "Password must be at least 8 characters."
     if not re.search(r"[A-Za-z]", pw):
@@ -485,11 +617,9 @@ def validate_password(pw: str) -> str | None:
     return None
 
 def dob_to_password(dob: date) -> str:
-    """Convert a date of birth to the MMDDYYYY reset password string."""
     return dob.strftime("%m%d%Y")
 
 def is_dob_password(plain: str, dob: date) -> bool:
-    """Check whether the supplied plain password matches the DOB reset value."""
     return plain == dob_to_password(dob)
 
 # ─────────────────────────────────────────────
@@ -501,7 +631,7 @@ if not st.session_state.logged_in:
 
     screen = st.session_state.auth_screen
 
-    # ── FORCE PASSWORD CHANGE (logged in via DOB reset or first-time setup) ─
+    # ── FORCE PASSWORD CHANGE ────────────────────────────────────────────
     if screen in ("set_password", "force_change"):
         if screen == "set_password":
             st.subheader("🔒 Set your password")
@@ -510,9 +640,11 @@ if not st.session_state.logged_in:
             st.subheader("🔒 Please set a new password")
             st.warning("You logged in with your temporary password. Choose a new password to continue.")
 
-        pw1 = st.text_input("New password", type="password", key="fc_pw1")
-        pw2 = st.text_input("Confirm password", type="password", key="fc_pw2")
-        if st.button("Set Password", use_container_width=True):
+        with st.form("force_change_form"):
+            pw1 = st.text_input("New password", type="password")
+            pw2 = st.text_input("Confirm password", type="password")
+            submitted = st.form_submit_button("Set Password", use_container_width=True)
+        if submitted:
             err = validate_password(pw1)
             if err:
                 st.error(err)
@@ -539,13 +671,16 @@ if not st.session_state.logged_in:
             st.session_state.pending_uid = None
             st.rerun()
 
-    # ── RESET PASSWORD (DOB lookup) ─────────────────────────────────────────
+    # ── RESET PASSWORD (DOB lookup) ──────────────────────────────────────
     elif screen == "reset":
         st.subheader("🔑 Reset your password")
         st.caption("Enter your username and date of birth. Your password will be reset to your DOB (MMDDYYYY) and you'll be prompted to change it on login.")
-        reset_u   = st.text_input("Username").strip().lower()
-        reset_dob = st.date_input("Date of Birth", min_value=date(1900, 1, 1), max_value=date.today(), value=None, format="MM/DD/YYYY")
-        if st.button("Reset Password", use_container_width=True):
+        with st.form("reset_form"):
+            reset_u = st.text_input("Username")
+            reset_dob = st.date_input("Date of Birth", min_value=date(1900, 1, 1), max_value=date.today(), value=None, format="MM/DD/YYYY")
+            submitted = st.form_submit_button("Reset Password", use_container_width=True)
+        if submitted:
+            reset_u = reset_u.strip().lower()
             if not reset_u or not reset_dob:
                 st.error("Please fill in both fields.")
             else:
@@ -554,7 +689,6 @@ if not st.session_state.logged_in:
                         text("SELECT id, date_of_birth FROM users WHERE username=:u"),
                         {"u": reset_u}
                     ).fetchone()
-                # Same error for wrong username or wrong DOB — no enumeration
                 if not row or not row.date_of_birth:
                     st.error("No account found with that username and date of birth.")
                 else:
@@ -562,7 +696,6 @@ if not st.session_state.logged_in:
                     if stored_dob != reset_dob:
                         st.error("No account found with that username and date of birth.")
                     else:
-                        # Reset password to MMDDYYYY
                         dob_pw = dob_to_password(stored_dob)
                         with engine.begin() as conn:
                             conn.execute(
@@ -576,19 +709,22 @@ if not st.session_state.logged_in:
             st.session_state.auth_screen = "login"
             st.rerun()
 
-    # ── SIGN UP ─────────────────────────────────────────────────────────────
+    # ── SIGN UP ───────────────────────────────────────────────────────────
     elif screen == "signup":
         st.subheader("🌲 Create Account")
-        nu  = st.text_input("Username").strip().lower()
-        fn  = st.text_input("First Name")
-        ln  = st.text_input("Last Name")
-        em  = st.text_input("Email")
-        dob = st.date_input("Date of Birth", min_value=date(1900, 1, 1), max_value=date.today(), value=None,
-                             help="Used to reset your password if you forget it", format="MM/DD/YYYY")
-        lk  = st.text_area("Travel Style / Interests")
-        pw1 = st.text_input("Password", type="password", key="su_pw1")
-        pw2 = st.text_input("Confirm Password", type="password", key="su_pw2")
-        if st.button("Sign Up", use_container_width=True):
+        with st.form("signup_form"):
+            nu = st.text_input("Username")
+            fn = st.text_input("First Name")
+            ln = st.text_input("Last Name")
+            em = st.text_input("Email")
+            dob = st.date_input("Date of Birth", min_value=date(1900, 1, 1), max_value=date.today(), value=None,
+                                 help="Used to reset your password if you forget it", format="MM/DD/YYYY")
+            lk = st.text_area("Travel Style / Interests")
+            pw1 = st.text_input("Password", type="password")
+            pw2 = st.text_input("Confirm Password", type="password")
+            submitted = st.form_submit_button("Sign Up", use_container_width=True)
+        if submitted:
+            nu = nu.strip().lower()
             if not nu:
                 st.error("Username is required.")
             elif not dob:
@@ -618,12 +754,15 @@ if not st.session_state.logged_in:
             st.session_state.auth_screen = "login"
             st.rerun()
 
-    # ── LOGIN ────────────────────────────────────────────────────────────────
+    # ── LOGIN ─────────────────────────────────────────────────────────────
     else:
         st.subheader("Welcome back")
-        u  = st.text_input("Username").strip().lower()
-        pw = st.text_input("Password", type="password", key="login_pw")
-        if st.button("Log In", use_container_width=True):
+        with st.form("login_form"):
+            u = st.text_input("Username")
+            pw = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Log In", use_container_width=True)
+        if submitted:
+            u = u.strip().lower()
             with engine.connect() as conn:
                 res = conn.execute(
                     text("SELECT id, username, firstname, lastname, email, likes, password_hash, date_of_birth FROM users WHERE username=:u"),
@@ -633,14 +772,12 @@ if not st.session_state.logged_in:
             if not res:
                 st.error("Invalid username or password.")
             elif not res["password_hash"]:
-                # Pre-password account — force setup without checking password
                 st.session_state.pending_uid = res["id"]
                 st.session_state.auth_screen = "set_password"
                 st.rerun()
             elif not check_password(pw, res["password_hash"]):
                 st.error("Invalid username or password.")
             else:
-                # Valid password — check if they logged in with their DOB reset password
                 dob = res["date_of_birth"]
                 logged_in_with_dob = (
                     dob is not None and
@@ -672,9 +809,13 @@ if not st.session_state.logged_in:
 else:
     current_uid = st.session_state.user_info['id']
 
-    new_badges = compute_and_award_badges(current_uid)
-    for b in new_badges:
-        st.toast(f"🏅 Badge unlocked: {b}!", icon="🎉")
+    # Badge check: only runs once per session (or after mark_badges_dirty()
+    # is called by an action that could earn one), instead of on every rerun.
+    if not st.session_state.badges_checked_session:
+        new_badges = compute_and_award_badges(current_uid)
+        st.session_state.badges_checked_session = True
+        for b in new_badges:
+            st.toast(f"🏅 Badge unlocked: {b}!", icon="🎉")
 
     with st.sidebar:
         st.write(f"Welcome back, **{st.session_state.user_info['firstname']}**")
@@ -682,26 +823,29 @@ else:
         if pending_count > 0:
             st.warning(f"🔔 **{pending_count}** pending notification(s)")
 
+        if st.button("🔄 Check for new badges", use_container_width=True):
+            mark_badges_dirty()
+            st.rerun()
+
         st.divider()
         with st.expander("✏️ Edit Profile"):
-            new_firstname = st.text_input("First Name", value=st.session_state.user_info.get("firstname", ""), key="profile_firstname")
-            new_lastname  = st.text_input("Last Name",  value=st.session_state.user_info.get("lastname",  ""), key="profile_lastname")
-            new_email     = st.text_input("Email",      value=st.session_state.user_info.get("email",     ""), key="profile_email")
-            new_likes     = st.text_area("Travel Style / Interests", value=st.session_state.user_info.get("likes", ""), key="profile_likes", height=100)
-
-            # Load current DOB from DB to pre-populate
             with engine.connect() as conn:
                 dob_row = conn.execute(text("SELECT date_of_birth FROM users WHERE id=:uid"), {"uid": current_uid}).fetchone()
             current_dob = dob_row.date_of_birth if dob_row and dob_row.date_of_birth else None
             if current_dob and not isinstance(current_dob, date):
                 current_dob = current_dob.date() if hasattr(current_dob, 'date') else None
             dob_display = current_dob.strftime("%m/%d/%Y") if current_dob else "Not set"
-            st.caption(f"🎂 Date of Birth: **{dob_display}** _(used for password reset)_")
-            new_dob = st.date_input("Update Date of Birth", value=current_dob,
-                                    min_value=date(1900, 1, 1), max_value=date.today(),
-                                    key="profile_dob", format="MM/DD/YYYY")
 
-            if st.button("💾 Save Profile", use_container_width=True):
+            with st.form("edit_profile_form"):
+                new_firstname = st.text_input("First Name", value=st.session_state.user_info.get("firstname", ""))
+                new_lastname = st.text_input("Last Name", value=st.session_state.user_info.get("lastname", ""))
+                new_email = st.text_input("Email", value=st.session_state.user_info.get("email", ""))
+                new_likes = st.text_area("Travel Style / Interests", value=st.session_state.user_info.get("likes", ""), height=100)
+                st.caption(f"🎂 Date of Birth: **{dob_display}** _(used for password reset)_")
+                new_dob = st.date_input("Update Date of Birth", value=current_dob,
+                                        min_value=date(1900, 1, 1), max_value=date.today(), format="MM/DD/YYYY")
+                save_profile = st.form_submit_button("💾 Save Profile", use_container_width=True)
+            if save_profile:
                 try:
                     with engine.begin() as conn:
                         conn.execute(text("""
@@ -715,10 +859,12 @@ else:
 
         st.divider()
         with st.expander("🔒 Change Password"):
-            cp_current = st.text_input("Current password", type="password", key="cp_current")
-            cp_new1    = st.text_input("New password",     type="password", key="cp_new1")
-            cp_new2    = st.text_input("Confirm new",      type="password", key="cp_new2")
-            if st.button("Update Password", use_container_width=True):
+            with st.form("change_password_form"):
+                cp_current = st.text_input("Current password", type="password")
+                cp_new1 = st.text_input("New password", type="password")
+                cp_new2 = st.text_input("Confirm new", type="password")
+                update_pw = st.form_submit_button("Update Password", use_container_width=True)
+            if update_pw:
                 with engine.connect() as conn:
                     row = conn.execute(text("SELECT password_hash FROM users WHERE id=:uid"),
                                        {"uid": current_uid}).fetchone()
@@ -784,6 +930,7 @@ else:
                     if c2.button("✅ Accept", key=f"notif_acc_friend_{req.id}"):
                         with engine.begin() as conn:
                             conn.execute(text("UPDATE friendships SET status='accepted' WHERE id=:rid"), {"rid": req.id})
+                        mark_badges_dirty()
                         st.rerun()
                     if c3.button("❌ Decline", key=f"notif_dec_friend_{req.id}"):
                         with engine.begin() as conn:
@@ -802,6 +949,7 @@ else:
                         with engine.begin() as conn:
                             conn.execute(text("UPDATE trip_participants SET invitation_status='accepted', responded_at=CURRENT_TIMESTAMP WHERE id=:pid"), {"pid": inv.participant_id})
                         st.success(f"You're going to **{inv.trip_name}**! 🎉")
+                        mark_badges_dirty()
                         st.rerun()
                     if col2.button("Decline ❌", key=f"notif_dec_trip_{inv.participant_id}"):
                         with engine.begin() as conn:
@@ -827,22 +975,14 @@ else:
         st.header("🔭 Park Explorer")
         st.caption("Browse all national parks, discover details, and save parks to your wishlist.")
 
-        with engine.connect() as conn:
-            all_parks_df = pd.read_sql(text("""
-                SELECT p.id, p.name, p.state, p.image_url,
-                       pd.description, pd.entrance_fee_cost, pd.visitor_center_hours,
-                       pd.weather_info, pd.activities, pd.latitude, pd.longitude,
-                       CASE WHEN pw.id IS NOT NULL THEN TRUE ELSE FALSE END AS wishlisted
-                FROM parks p
-                LEFT JOIN park_details pd ON p.id=pd.park_id
-                LEFT JOIN park_wishlists pw ON p.id=pw.park_id AND pw.user_id=:uid
-                ORDER BY p.name
-            """), conn, params={"uid": current_uid})
-            active_alerts_df = pd.read_sql(text("""
-                SELECT park_id, COUNT(*) AS alert_count FROM alerts WHERE isactive=TRUE GROUP BY park_id
-            """), conn)
+        all_parks_df = get_parks_with_details()  # cached, ttl=600s
+        alert_map = get_active_alerts_map()      # cached, ttl=60s
 
-        alert_map = dict(zip(active_alerts_df['park_id'], active_alerts_df['alert_count'])) if not active_alerts_df.empty else {}
+        with engine.connect() as conn:
+            wishlist_ids = {r[0] for r in conn.execute(
+                text("SELECT park_id FROM park_wishlists WHERE user_id=:uid"), {"uid": current_uid}).fetchall()}
+        all_parks_df = all_parks_df.copy()
+        all_parks_df['wishlisted'] = all_parks_df['id'].isin(wishlist_ids)
 
         fc1, fc2, fc3 = st.columns([2, 2, 1])
         search_q = fc1.text_input("🔍 Search parks", placeholder="e.g. Yellowstone, CA...")
@@ -850,7 +990,7 @@ else:
         state_filter = fc2.selectbox("Filter by State", ["All States"] + states)
         wishlist_only = fc3.checkbox("❤️ Wishlist only")
 
-        filtered = all_parks_df.copy()
+        filtered = all_parks_df
         if search_q:
             filtered = filtered[filtered['name'].str.contains(search_q, case=False, na=False) |
                                  filtered['state'].str.contains(search_q, case=False, na=False)]
@@ -1029,6 +1169,7 @@ else:
                             if rc2.button("Accept", key=f"search_accept_{res.id}"):
                                 with engine.begin() as conn:
                                     conn.execute(text("UPDATE friendships SET status='accepted' WHERE user_id=:them AND friend_id=:me"), {"them": res.id, "me": current_uid})
+                                mark_badges_dirty()
                                 st.rerun()
                         else:
                             if rc2.button("➕ Add", key=f"search_add_{res.id}"):
@@ -1093,6 +1234,7 @@ else:
             if c2.button("Accept ✅", key=f"acc_friend_{req.id}"):
                 with engine.begin() as conn:
                     conn.execute(text("UPDATE friendships SET status='accepted' WHERE id=:rid"), {"rid": req.id})
+                mark_badges_dirty()
                 st.rerun()
 
     # ─────────────────────────────────────────────
@@ -1106,7 +1248,6 @@ else:
                 WHERE ((f.user_id=:uid OR f.friend_id=:uid) AND f.status='accepted') AND u.id!=:uid
             """), {"uid": current_uid}).fetchall()
             friend_options = {fr[1]: fr[0] for fr in friends_res}
-            df_parks = pd.read_sql(text("SELECT name, id FROM parks ORDER BY name"), conn)
             templates = conn.execute(text("""
                 SELECT t.id, t.trip_name, t.start_date, t.end_date,
                        STRING_AGG(p.name, ', ' ORDER BY p.name) AS park_names
@@ -1115,6 +1256,7 @@ else:
                 WHERE tp.user_id=:uid AND t.is_template=TRUE AND tp.role='owner'
                 GROUP BY t.id, t.trip_name, t.start_date, t.end_date ORDER BY t.trip_name
             """), {"uid": current_uid}).fetchall()
+        df_parks = get_park_name_id_df()  # cached
 
         if templates:
             st.markdown("**📋 Start from a Template**")
@@ -1168,17 +1310,20 @@ else:
                 st.session_state.activity_day_defaults = {}
                 st.session_state.park_distances = []
                 st.session_state.conflict_warnings = {}
-                # FIX: save a stable copy of parks at generate time
                 st.session_state.active_parks_saved = list(selected_parks)
 
                 parks_label = ", ".join(selected_parks)
                 travel_styles = [f"{st.session_state.user_info['firstname']}: {st.session_state.user_info['likes']}"]
                 if invite_roles:
+                    # FIX: batched lookup instead of one query per invited friend
                     with engine.connect() as conn:
-                        for fname in invite_roles.keys():
-                            friend_likes = conn.execute(text("SELECT firstname, likes FROM users WHERE username=:u"), {"u": fname}).fetchone()
-                            if friend_likes and friend_likes.likes:
-                                travel_styles.append(f"{friend_likes.firstname}: {friend_likes.likes}")
+                        friend_rows = conn.execute(
+                            text("SELECT firstname, likes FROM users WHERE username = ANY(:names)"),
+                            {"names": list(invite_roles.keys())}
+                        ).fetchall()
+                    for fr in friend_rows:
+                        if fr.likes:
+                            travel_styles.append(f"{fr.firstname}: {fr.likes}")
 
                 group_note = (f"This is a group trip. Balance activities for everyone's styles:\n" +
                               "\n".join(f"  - {s}" for s in travel_styles)) if len(travel_styles) > 1 else f"Travel Style: {st.session_state.user_info['likes']}"
@@ -1206,14 +1351,12 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                     if split_token in resp:
                         raw_acts, raw_itinerary = resp.split(split_token, 1)
                     else:
-                        # Fallback: lines with 3+ pipes are activities, rest is itinerary
                         lines = resp.strip().split('\n')
-                        act_lines   = [l for l in lines if l.count('|') >= 3]
+                        act_lines = [l for l in lines if l.count('|') >= 3]
                         other_lines = [l for l in lines if l.count('|') < 3]
-                        raw_acts      = '\n'.join(act_lines)
+                        raw_acts = '\n'.join(act_lines)
                         raw_itinerary = '\n'.join(other_lines)
 
-                    # Only keep lines that look like valid activity rows (exactly 3 pipes)
                     st.session_state.temp_activities = [
                         l.strip() for l in raw_acts.strip().split('\n')
                         if l.strip() and l.count('|') >= 3
@@ -1237,7 +1380,6 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                     with st.spinner("Calculating park distances..."):
                         st.session_state.park_distances = fetch_park_distances(selected_parks)
 
-        # Park distance banner
         if st.session_state.park_distances:
             st.divider()
             st.subheader("🚗 Park-to-Park Drive Times")
@@ -1251,8 +1393,6 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                         if leg.get("tip"):
                             st.caption(f"💡 {leg['tip']}")
 
-        # ── ACTIVITY BOARD ──
-        # FIX: use stable saved parks; board always renders if we have activities + dates
         active_parks = st.session_state.active_parks_saved or st.session_state.get("selected_parks") or selected_parks
         board_start = st.session_state.trip_start
         board_end = st.session_state.trip_end
@@ -1267,20 +1407,24 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
 
             with left:
                 st.subheader("💡 Suggested Activities")
-                with engine.connect() as conn:
+                # FIX: batched image lookup instead of one query per park
+                if active_parks:
+                    with engine.connect() as conn:
+                        img_rows = conn.execute(
+                            text("SELECT name, image_url FROM parks WHERE name = ANY(:names)"),
+                            {"names": list(active_parks)}
+                        ).fetchall()
+                    img_map = {r.name: r.image_url for r in img_rows}
                     for park_name in active_parks:
-                        park_img = conn.execute(text("SELECT image_url FROM parks WHERE name=:n"), {"n": park_name}).scalar()
-                        if park_img:
-                            st.image(park_img, caption=park_name, use_container_width=True)
+                        if img_map.get(park_name):
+                            st.image(img_map[park_name], caption=park_name, use_container_width=True)
 
-                # Build sorted activity list with stable day defaults
                 sorted_activities = []
                 for i, act in enumerate(st.session_state.temp_activities):
                     parts = act.split('|')
-                    name   = parts[0].strip()
+                    name = parts[0].strip()
                     a_type = parts[1].strip() if len(parts) > 1 else "Activity"
                     a_park = parts[2].strip() if len(parts) > 2 else ""
-                    # FIX: robust default lookup — try int key first, then str key, then 1
                     raw = st.session_state.activity_day_defaults.get(i, st.session_state.activity_day_defaults.get(str(i), 1))
                     suggested_day = raw if raw in day_options else (day_options[0] if day_options else 1)
                     sorted_activities.append((i, name, a_type, a_park, suggested_day))
@@ -1306,7 +1450,6 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                         day_date = next((d[1] for d in days if d[0] == suggested_day), None)
                         day_label = f"Day {suggested_day}" + (f" — {day_date.strftime('%a, %b %d')}" if day_date else "")
                         st.markdown(f"**📅 {day_label}**")
-                    # FIX: clamp index so it never crashes
                     default_index = day_options.index(suggested_day) if suggested_day in day_options else 0
                     with st.container(border=True):
                         ac1, ac2, ac3 = st.columns([2, 2, 1])
@@ -1342,7 +1485,6 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                      conflict_warnings=st.session_state.conflict_warnings)
 
                 st.divider()
-                # FIX: master itinerary always rendered here inside the board block where it belongs
                 if st.session_state.master_itinerary:
                     st.subheader("📖 AI Master Itinerary")
                     st.markdown(st.session_state.master_itinerary)
@@ -1357,6 +1499,7 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                         try:
                             parks_label = ", ".join(active_parks)
                             trip_name = f"{parks_label} Trip" if len(active_parks) == 1 else f"Multi-Park Trip: {parks_label}"
+                            park_id_map = dict(zip(df_parks['name'], df_parks['id']))
                             with engine.begin() as conn:
                                 tid = conn.execute(text("""
                                     INSERT INTO trips (user_id, owner_id, trip_name, start_date, end_date)
@@ -1370,12 +1513,11 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                         conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t,:u,:role,'pending',:inviter)"),
                                                      {"t": tid, "u": fid, "role": f_role, "inviter": current_uid})
                                 for park_name in active_parks:
-                                    park_row = df_parks[df_parks['name'] == park_name]
-                                    if not park_row.empty:
-                                        p_id = int(park_row['id'].iloc[0])
+                                    p_id = park_id_map.get(park_name)
+                                    if p_id is not None:
                                         notes_text = f"MASTER ITINERARY:\n{st.session_state.master_itinerary}" if park_name == active_parks[0] else ""
                                         conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t,:p,:n)"),
-                                                     {"t": tid, "p": p_id, "n": notes_text})
+                                                     {"t": tid, "p": int(p_id), "n": notes_text})
                                 for day_num, activities in st.session_state.day_activities.items():
                                     for order, act in enumerate(activities):
                                         conn.execute(text("INSERT INTO trip_activities (trip_id, day_number, activity_name, activity_type, sort_order) VALUES (:tid,:day,:name,:atype,:order)"),
@@ -1393,6 +1535,7 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
 
                             st.success("Adventure locked in! 🎉")
                             st.balloons()
+                            mark_badges_dirty()
                             for k in ["day_activities", "activity_day_defaults", "conflict_warnings"]:
                                 st.session_state[k] = {}
                             for k in ["temp_activities", "park_distances", "active_parks_saved"]:
@@ -1413,6 +1556,7 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                         try:
                             parks_label = ", ".join(active_parks)
                             tmpl_name = f"Template: {parks_label}"
+                            park_id_map = dict(zip(df_parks['name'], df_parks['id']))
                             with engine.begin() as conn:
                                 tmpl_tid = conn.execute(text("""
                                     INSERT INTO trips (user_id, owner_id, trip_name, start_date, end_date, is_template)
@@ -1421,11 +1565,10 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                 conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t,:u,'owner','accepted',:u)"),
                                              {"t": tmpl_tid, "u": current_uid})
                                 for park_name in active_parks:
-                                    park_row = df_parks[df_parks['name'] == park_name]
-                                    if not park_row.empty:
-                                        p_id = int(park_row['id'].iloc[0])
+                                    p_id = park_id_map.get(park_name)
+                                    if p_id is not None:
                                         conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t,:p,'')"),
-                                                     {"t": tmpl_tid, "p": p_id})
+                                                     {"t": tmpl_tid, "p": int(p_id)})
                                 for day_num, activities in st.session_state.day_activities.items():
                                     for order, act in enumerate(activities):
                                         conn.execute(text("INSERT INTO trip_activities (trip_id, day_number, activity_name, activity_type, sort_order) VALUES (:tid,:day,:name,:atype,:order)"),
@@ -1457,20 +1600,25 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                 GROUP BY t.id, t.trip_name, t.start_date, t.end_date, u_owner.firstname, u_owner.lastname, tp.role, t.recap_text, t.rating, t.review_text, t.is_public
                 ORDER BY t.start_date DESC
             """), {"uid": current_uid}).fetchall()
-            all_parks = pd.read_sql(text("SELECT name, id FROM parks ORDER BY name"), conn)
 
         if not trips:
             st.info("No trips yet! Head to Plan Trip to start your first adventure 🏕️")
         else:
+            all_parks = get_park_name_id_df()  # cached
+
             for t in trips:
                 role_badge = "👑 Owner" if t.role == "owner" else "✏️ Collaborator" if t.role == "collaborator" else "👁️ Viewer"
-                # FIX: full trip status with Happening Now / Upcoming / Completed
                 status_emoji, status_label, _ = trip_status(t.start_date, t.end_date)
                 trip_end_d = t.end_date if isinstance(t.end_date, date) else (date.fromisoformat(str(t.end_date)) if t.end_date else None)
+                trip_start_d = t.start_date if isinstance(t.start_date, date) else (date.fromisoformat(str(t.start_date)) if t.start_date else None)
                 label = f"{status_emoji} {t.trip_name}  —  {role_badge}  ·  {status_label}"
                 editable = can_edit(t.role)
 
                 with st.expander(label):
+                    # Heavy per-trip data: fetched once, cached in session_state,
+                    # not requeried on every rerun (only when this trip changes).
+                    data = get_trip_data(t.id, trip_start_d)
+
                     if t.park_images:
                         imgs = [img for img in t.park_images.split('|') if img]
                         if imgs:
@@ -1497,9 +1645,7 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                             if st.button(toggle_label, key=f"toggle_edit_{t.id}"):
                                 st.session_state[edit_key] = not st.session_state[edit_key]
                                 st.rerun()
-                        with engine.connect() as conn_pdf:
-                            trip_parks_rows = get_trip_parks(conn_pdf, t.id)
-                        all_notes_txt = "\n\n".join(f"=== {tp.park_name} ===\n{tp.notes}" for tp in trip_parks_rows if tp.notes)
+                        all_notes_txt = "\n\n".join(f"=== {tp.park_name} ===\n{tp.notes}" for tp in data["trip_parks"] if tp.notes)
                         if all_notes_txt:
                             pdf_b = create_pdf(all_notes_txt, t.trip_name, st.session_state.user_info['firstname'])
                             st.download_button("📥 PDF", pdf_b, f"Trip_{t.id}.pdf", key=f"dl_{t.id}")
@@ -1515,6 +1661,7 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                     with engine.begin() as conn:
                                         conn.execute(text("DELETE FROM trips WHERE id=:tid"), {"tid": t.id})
                                     st.session_state[confirm_del_key] = False
+                                    invalidate_trip_data(t.id)
                                     st.success("Trip deleted.")
                                     st.rerun()
                                 if dn.button("Cancel", key=f"confirm_del_no_{t.id}"):
@@ -1526,31 +1673,24 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                         st.divider()
                         st.markdown("### ✏️ Edit Trip")
                         new_name = st.text_input("Trip Name", value=t.trip_name, key=f"name_{t.id}")
-                        start = t.start_date if isinstance(t.start_date, date) else date.fromisoformat(str(t.start_date)) if t.start_date else date.today()
-                        end   = t.end_date   if isinstance(t.end_date,   date) else date.fromisoformat(str(t.end_date))   if t.end_date   else date.today()
+                        start = trip_start_d or date.today()
+                        end = trip_end_d or date.today()
                         new_dates = st.date_input("Dates", value=(start, end), key=f"dates_{t.id}")
 
                         st.markdown("**Parks**")
-                        with engine.connect() as conn2:
-                            trip_parks_rows = get_trip_parks(conn2, t.id)
-                        current_park_names = [tp.park_name for tp in trip_parks_rows]
+                        current_park_names = [tp.park_name for tp in data["trip_parks"]]
                         new_park_selection = st.multiselect("Select Parks", options=all_parks['name'].tolist(), default=current_park_names, key=f"parks_edit_{t.id}")
 
                         st.markdown("**Park Notes / Itinerary**")
                         park_notes_map = {}
-                        existing_notes = {tp.park_name: tp.notes for tp in trip_parks_rows}
+                        existing_notes = {tp.park_name: tp.notes for tp in data["trip_parks"]}
                         for pname in new_park_selection:
                             park_notes_map[pname] = st.text_area(f"Notes for {pname}", value=existing_notes.get(pname, ""), height=150, key=f"notes_{t.id}_{pname}")
 
                         st.markdown("**Edit Day Activities**")
-                        with engine.connect() as conn2:
-                            saved_acts = conn2.execute(text("""
-                                SELECT id, day_number, activity_name, activity_type, sort_order
-                                FROM trip_activities WHERE trip_id=:tid ORDER BY day_number, sort_order
-                            """), {"tid": t.id}).fetchall()
                         edit_days = date_range_days(start, end)
                         edit_day_acts = {d[0]: [] for d in edit_days}
-                        for a in saved_acts:
+                        for a in data["acts"]:
                             if a.day_number in edit_day_acts:
                                 edit_day_acts[a.day_number].append({"id": str(a.id), "name": a.activity_name, "type": a.activity_type or ""})
                         render_dnd_itinerary(edit_day_acts, edit_days, editable=True)
@@ -1559,47 +1699,49 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                         na1, na2, na3, na4 = st.columns([3, 2, 2, 1])
                         new_act_name = na1.text_input("Activity name", key=f"new_act_name_{t.id}")
                         new_act_type = na2.text_input("Type", key=f"new_act_type_{t.id}")
-                        new_act_day  = na3.selectbox("Day", [d[0] for d in edit_days], key=f"new_act_day_{t.id}")
+                        new_act_day = na3.selectbox("Day", [d[0] for d in edit_days], key=f"new_act_day_{t.id}")
                         if na4.button("Add", key=f"add_new_act_{t.id}") and new_act_name:
-                            with engine.connect() as conn2:
+                            with engine.begin() as conn2:
                                 max_order = conn2.execute(text("SELECT COALESCE(MAX(sort_order),0) FROM trip_activities WHERE trip_id=:tid AND day_number=:day"),
                                                           {"tid": t.id, "day": new_act_day}).scalar()
                                 conn2.execute(text("INSERT INTO trip_activities (trip_id, day_number, activity_name, activity_type, sort_order) VALUES (:tid,:day,:name,:atype,:order)"),
                                               {"tid": t.id, "day": new_act_day, "name": new_act_name, "atype": new_act_type, "order": max_order+1})
-                                conn2.commit()
+                            invalidate_trip_data(t.id)
                             st.rerun()
 
-                        if saved_acts:
+                        if data["acts"]:
                             st.markdown("**Move or delete a saved activity:**")
-                            for sa in saved_acts:
+                            for sa in data["acts"]:
                                 sa1, sa2, sa3, sa4 = st.columns([3, 2, 1, 1])
                                 sa1.write(f"Day {sa.day_number} — {sa.activity_name}")
                                 move_day = sa2.selectbox("Move to", [d[0] for d in edit_days], key=f"mv_day_{sa.id}", index=sa.day_number - 1)
                                 if sa3.button("Move", key=f"mv_btn_{sa.id}"):
                                     with engine.begin() as conn2:
                                         conn2.execute(text("UPDATE trip_activities SET day_number=:day WHERE id=:aid"), {"day": move_day, "aid": sa.id})
+                                    invalidate_trip_data(t.id)
                                     st.rerun()
                                 if sa4.button("🗑️", key=f"del_act_{sa.id}"):
                                     with engine.begin() as conn2:
                                         conn2.execute(text("DELETE FROM trip_activities WHERE id=:aid"), {"aid": sa.id})
+                                    invalidate_trip_data(t.id)
                                     st.rerun()
 
                         if t.role == "owner":
                             st.markdown("**Manage Participant Permissions**")
-                            with engine.connect() as conn2:
-                                participants = conn2.execute(text("""
-                                    SELECT tp.id, u.username, u.firstname, tp.role, tp.invitation_status
-                                    FROM trip_participants tp JOIN users u ON tp.user_id=u.id
-                                    WHERE tp.trip_id=:tid AND tp.role!='owner'
-                                """), {"tid": t.id}).fetchall()
-                            for p in participants:
+                            for p in data["participants"]:
+                                if p.role == "owner":
+                                    continue
                                 pc1, pc2, pc3 = st.columns([2, 2, 1])
                                 pc1.write(f"**{p.firstname}** (@{p.username})")
                                 pc1.caption(f"Status: {p.invitation_status}")
-                                new_role = pc2.selectbox("Role", ["collaborator", "viewer"], index=0 if p.role=="collaborator" else 1, key=f"role_{t.id}_{p.id}")
-                                if pc3.button("Update", key=f"update_role_{t.id}_{p.id}"):
+                                new_role = pc2.selectbox("Role", ["collaborator", "viewer"], index=0 if p.role=="collaborator" else 1, key=f"role_{t.id}_{p.username}")
+                                if pc3.button("Update", key=f"update_role_{t.id}_{p.username}"):
                                     with engine.begin() as conn2:
-                                        conn2.execute(text("UPDATE trip_participants SET role=:r WHERE id=:pid"), {"r": new_role, "pid": p.id})
+                                        conn2.execute(text("""
+                                            UPDATE trip_participants SET role=:r WHERE trip_id=:tid
+                                              AND user_id=(SELECT id FROM users WHERE username=:un)
+                                        """), {"r": new_role, "tid": t.id, "un": p.username})
+                                    invalidate_trip_data(t.id)
                                     st.rerun()
 
                         if st.button("💾 Save Changes", key=f"save_{t.id}"):
@@ -1607,18 +1749,19 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                 st.error("Please select at least one park.")
                             else:
                                 try:
+                                    park_id_map = dict(zip(all_parks['name'], all_parks['id']))
                                     with engine.begin() as conn2:
                                         conn2.execute(text("UPDATE trips SET trip_name=:name, start_date=:s, end_date=:e WHERE id=:tid"),
                                                       {"name": new_name, "s": new_dates[0] if len(new_dates)>1 else start, "e": new_dates[1] if len(new_dates)>1 else end, "tid": t.id})
-                                        removed_parks = [tp for tp in trip_parks_rows if tp.park_name not in new_park_selection]
+                                        removed_parks = [tp for tp in data["trip_parks"] if tp.park_name not in new_park_selection]
                                         for rp in removed_parks:
                                             conn2.execute(text("DELETE FROM trip_parks WHERE id=:tpkid"), {"tpkid": rp.trip_park_id})
-                                        existing_park_names = {tp.park_name: tp.trip_park_id for tp in trip_parks_rows}
+                                        existing_park_names = {tp.park_name: tp.trip_park_id for tp in data["trip_parks"]}
                                         for pname in new_park_selection:
-                                            prow = all_parks[all_parks['name']==pname]
-                                            if prow.empty:
+                                            pid = park_id_map.get(pname)
+                                            if pid is None:
                                                 continue
-                                            pid = int(prow['id'].iloc[0])
+                                            pid = int(pid)
                                             notes = park_notes_map.get(pname, "")
                                             if pname in existing_park_names:
                                                 conn2.execute(text("UPDATE trip_parks SET park_id=:p, notes=:n WHERE id=:tpkid"),
@@ -1628,24 +1771,15 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                                               {"t": t.id, "p": pid, "n": notes})
                                     st.success("Trip updated! ✅")
                                     st.session_state[edit_key] = False
+                                    invalidate_trip_data(t.id)
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Error saving: {e}")
 
                     # ── READ-ONLY VIEW ──
                     else:
-                        with engine.connect() as conn2:
-                            saved_acts = conn2.execute(text("""
-                                SELECT day_number, activity_name, activity_type
-                                FROM trip_activities WHERE trip_id=:tid ORDER BY day_number, sort_order
-                            """), {"tid": t.id}).fetchall()
-                        with engine.connect() as conn2:
-                            all_notes_rows = conn2.execute(text("""
-                                SELECT tdn.id, tdn.day_number, tdn.note_text, tdn.created_at,
-                                       u.firstname, u.lastname, tdn.author_id
-                                FROM trip_day_notes tdn JOIN users u ON tdn.author_id=u.id
-                                WHERE tdn.trip_id=:tid ORDER BY tdn.day_number, tdn.created_at
-                            """), {"tid": t.id}).fetchall()
+                        saved_acts = data["acts"]
+                        all_notes_rows = data["notes"]
                         notes_by_day = {}
                         for n in all_notes_rows:
                             notes_by_day.setdefault(n.day_number, []).append(n)
@@ -1653,26 +1787,14 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                         for a in saved_acts:
                             day_act_map.setdefault(a.day_number, []).append(a)
 
-                        # Active NPS alerts
-                        with engine.connect() as conn2:
-                            trip_park_ids = [tp.park_id for tp in get_trip_parks(conn2, t.id)]
-                        if trip_park_ids:
-                            with engine.connect() as conn2:
-                                trip_alerts = conn2.execute(text("""
-                                    SELECT a.title, a.category, a.description, p.name AS park_name
-                                    FROM alerts a JOIN parks p ON a.park_id=p.id
-                                    WHERE a.park_id=ANY(:pids) AND a.isactive=TRUE
-                                    ORDER BY p.name, a.category
-                                """), {"pids": trip_park_ids}).fetchall()
-                            if trip_alerts:
-                                st.divider()
-                                with st.expander(f"🚨 {len(trip_alerts)} active NPS alert(s) for this trip", expanded=False):
-                                    for al in trip_alerts:
-                                        st.warning(f"**{al.park_name} — {al.category}:** {al.title}")
-                                        if al.description:
-                                            st.caption(al.description[:300])
+                        if data["alerts"]:
+                            st.divider()
+                            with st.expander(f"🚨 {len(data['alerts'])} active NPS alert(s) for this trip", expanded=False):
+                                for al in data["alerts"]:
+                                    st.warning(f"**{al.park_name} — {al.category}:** {al.title}")
+                                    if al.description:
+                                        st.caption(al.description[:300])
 
-                        # Day-by-day
                         view_days = date_range_days(t.start_date, t.end_date)
                         st.divider()
                         st.markdown("**📅 Day-by-Day:**")
@@ -1701,6 +1823,7 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                             if note_col2.button("🗑️", key=f"del_note_{note.id}"):
                                                 with engine.begin() as conn2:
                                                     conn2.execute(text("DELETE FROM trip_day_notes WHERE id=:nid"), {"nid": note.id})
+                                                invalidate_trip_data(t.id)
                                                 st.rerun()
                                 new_note = st.text_input(
                                     f"Add a note for Day {day_num}",
@@ -1713,15 +1836,11 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                         with engine.begin() as conn2:
                                             conn2.execute(text("INSERT INTO trip_day_notes (trip_id, day_number, author_id, note_text) VALUES (:tid,:day,:uid,:note)"),
                                                           {"tid": t.id, "day": day_num, "uid": current_uid, "note": new_note.strip()})
+                                        invalidate_trip_data(t.id)
+                                        mark_badges_dirty()
                                         st.rerun()
 
-                        # Packing list
-                        with engine.connect() as conn2:
-                            packing_rows = conn2.execute(text("""
-                                SELECT id, category, item_name, is_checked
-                                FROM trip_packing_items WHERE trip_id=:tid ORDER BY category, item_name
-                            """), {"tid": t.id}).fetchall()
-
+                        packing_rows = data["packing"]
                         st.divider()
                         if packing_rows:
                             with st.expander("🎒 Packing List", expanded=False):
@@ -1742,15 +1861,15 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                             if checked != item.is_checked:
                                                 with engine.begin() as conn2:
                                                     conn2.execute(text("UPDATE trip_packing_items SET is_checked=:c WHERE id=:iid"), {"c": checked, "iid": item.id})
+                                                invalidate_trip_data(t.id)
+                                                mark_badges_dirty()
+                                                st.rerun()
                         else:
-                            # FIX: fallback generator for trips saved before packing list feature
                             with st.expander("🎒 Packing List", expanded=False):
                                 st.caption("No packing list yet for this trip.")
-                                with engine.connect() as conn2:
-                                    pl_park_names = [tp.park_name for tp in get_trip_parks(conn2, t.id)]
-                                    pl_act_types = [a.activity_type for a in conn2.execute(text(
-                                        "SELECT activity_type FROM trip_activities WHERE trip_id=:tid"), {"tid": t.id}).fetchall()]
-                                num_days_pl = (trip_end_d - (t.start_date if isinstance(t.start_date, date) else date.fromisoformat(str(t.start_date)))).days + 1 if trip_end_d else 1
+                                pl_park_names = [tp.park_name for tp in data["trip_parks"]]
+                                pl_act_types = [a.activity_type for a in saved_acts]
+                                num_days_pl = (trip_end_d - trip_start_d).days + 1 if trip_end_d and trip_start_d else 1
                                 if st.button("✨ Generate Packing List", key=f"gen_pack_{t.id}"):
                                     with st.spinner("Packing your bags..."):
                                         new_items = generate_packing_list(pl_park_names, pl_act_types, num_days_pl)
@@ -1759,11 +1878,11 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                             for item in new_items:
                                                 conn2.execute(text("INSERT INTO trip_packing_items (trip_id, category, item_name) VALUES (:tid,:cat,:item)"),
                                                               {"tid": t.id, "cat": item.get("category", "General"), "item": item.get("item", "")})
+                                        invalidate_trip_data(t.id)
                                         st.rerun()
                                     else:
                                         st.error("Couldn't generate packing list. Try again.")
 
-                        # AI Trip Recap (past trips only)
                         if trip_end_d and trip_end_d < date.today():
                             st.divider()
                             st.markdown("**✍️ Trip Recap**")
@@ -1778,12 +1897,10 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                             if st.session_state.get(gen_key) or not t.recap_text:
                                 if st.button("🤖 Generate AI Recap", key=f"do_recap_{t.id}"):
                                     with st.spinner("Writing your story..."):
-                                        recap_acts  = [{"day": a.day_number, "name": a.activity_name} for a in saved_acts]
+                                        recap_acts = [{"day": a.day_number, "name": a.activity_name} for a in saved_acts]
                                         recap_notes = [{"day": n.day_number, "text": n.note_text} for n in all_notes_rows]
                                         park_names_list = [p.strip() for p in (t.park_names or "").split(",") if p.strip()]
-                                        start_d = t.start_date if isinstance(t.start_date, date) else date.fromisoformat(str(t.start_date)) if t.start_date else None
-                                        end_d_r = t.end_date   if isinstance(t.end_date,   date) else date.fromisoformat(str(t.end_date))   if t.end_date   else None
-                                        recap = generate_trip_recap(t.trip_name, park_names_list, recap_acts, recap_notes, start_d, end_d_r)
+                                        recap = generate_trip_recap(t.trip_name, park_names_list, recap_acts, recap_notes, trip_start_d, trip_end_d)
                                     if recap:
                                         with engine.begin() as conn2:
                                             conn2.execute(text("UPDATE trips SET recap_text=:r WHERE id=:tid"), {"r": recap, "tid": t.id})
@@ -1792,87 +1909,44 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                     else:
                                         st.error("Couldn't generate recap. Try again.")
 
-                        # Park notes / master itinerary stored in DB
-                        with engine.connect() as conn2:
-                            trip_parks_rows_view = get_trip_parks(conn2, t.id)
-                        if trip_parks_rows_view:
+                        if data["trip_parks"]:
                             st.divider()
-                            for tp in trip_parks_rows_view:
+                            for tp in data["trip_parks"]:
                                 if tp.notes:
                                     st.markdown(f"**📍 {tp.park_name}**")
                                     st.markdown(tp.notes)
 
-                    # Trip crew — always visible
-                    with engine.connect() as conn2:
-                        participants = conn2.execute(text("""
-                            SELECT u.firstname, u.lastname, u.username, tp.role, tp.invitation_status
-                            FROM trip_participants tp JOIN users u ON tp.user_id=u.id
-                            WHERE tp.trip_id=:tid ORDER BY tp.role
-                        """), {"tid": t.id}).fetchall()
-                    if participants:
+                    # Trip crew — always visible, from cached data (no extra query)
+                    if data["participants"]:
                         st.divider()
                         st.markdown("**Trip Crew:**")
-                        for p in participants:
+                        for p in data["participants"]:
                             status_icon = "✅" if p.invitation_status=="accepted" else "⏳" if p.invitation_status=="pending" else "❌"
-                            role_icon   = "👑" if p.role=="owner" else "✏️" if p.role=="collaborator" else "👁️"
+                            role_icon = "👑" if p.role=="owner" else "✏️" if p.role=="collaborator" else "👁️"
                             st.caption(f"{status_icon} {p.firstname} {p.lastname} (@{p.username}) — {role_icon} {p.role}")
 
-                    # ── CROWD CALENDAR & SEASONAL WARNINGS ─────────────────
-                    with engine.connect() as conn2:
-                        trip_park_ids_cc = [tp.park_id for tp in get_trip_parks(conn2, t.id)]
-                    if trip_park_ids_cc:
-                        trip_month = t.start_date.month if isinstance(t.start_date, date) else (date.fromisoformat(str(t.start_date)).month if t.start_date else None)
-                        if trip_month:
-                            with engine.connect() as conn2:
-                                crowd_rows = conn2.execute(text("""
-                                    SELECT p.name AS park_name, pcc.crowd_level, pcc.notes
-                                    FROM park_crowd_calendar pcc
-                                    JOIN parks p ON pcc.park_id=p.id
-                                    WHERE pcc.park_id=ANY(:pids) AND pcc.month=:m
-                                    ORDER BY p.name
-                                """), {"pids": trip_park_ids_cc, "m": trip_month}).fetchall()
-                                warn_rows = conn2.execute(text("""
-                                    SELECT p.name AS park_name, psw.warning_type, psw.description
-                                    FROM park_seasonal_warnings psw
-                                    JOIN parks p ON psw.park_id=p.id
-                                    WHERE psw.park_id=ANY(:pids)
-                                      AND (
-                                        (psw.month_start <= psw.month_end AND :m BETWEEN psw.month_start AND psw.month_end)
-                                        OR (psw.month_start > psw.month_end AND (:m >= psw.month_start OR :m <= psw.month_end))
-                                      )
-                                    ORDER BY p.name
-                                """), {"pids": trip_park_ids_cc, "m": trip_month}).fetchall()
-                            if crowd_rows or warn_rows:
-                                st.divider()
-                                crowd_icon = {"Low": "🟢", "Moderate": "🟡", "High": "🟠", "Very High": "🔴"}
-                                if crowd_rows:
-                                    with st.expander(f"📅 Crowd Forecast for your travel month", expanded=False):
-                                        for cr in crowd_rows:
-                                            icon = crowd_icon.get(cr.crowd_level, "⚪")
-                                            st.markdown(f"**{cr.park_name}** — {icon} {cr.crowd_level}")
-                                            if cr.notes:
-                                                st.caption(cr.notes)
-                                if warn_rows:
-                                    warn_icons = {"Closure": "🚫", "Snow": "❄️", "Heat": "🌡️",
-                                                  "Flooding": "🌊", "Wildlife": "🐻", "Smoke": "💨", "Lightning": "⚡"}
-                                    with st.expander(f"⚠️ {len(warn_rows)} seasonal warning(s) for this month", expanded=False):
-                                        for wr in warn_rows:
-                                            wi = warn_icons.get(wr.warning_type, "⚠️")
-                                            st.warning(f"**{wr.park_name}** — {wi} {wr.warning_type}: {wr.description}")
+                    if data["crowd"] or data["warnings"]:
+                        st.divider()
+                        crowd_icon = {"Low": "🟢", "Moderate": "🟡", "High": "🟠", "Very High": "🔴"}
+                        if data["crowd"]:
+                            with st.expander(f"📅 Crowd Forecast for your travel month", expanded=False):
+                                for cr in data["crowd"]:
+                                    icon = crowd_icon.get(cr.crowd_level, "⚪")
+                                    st.markdown(f"**{cr.park_name}** — {icon} {cr.crowd_level}")
+                                    if cr.notes:
+                                        st.caption(cr.notes)
+                        if data["warnings"]:
+                            warn_icons = {"Closure": "🚫", "Snow": "❄️", "Heat": "🌡️",
+                                          "Flooding": "🌊", "Wildlife": "🐻", "Smoke": "💨", "Lightning": "⚡"}
+                            with st.expander(f"⚠️ {len(data['warnings'])} seasonal warning(s) for this month", expanded=False):
+                                for wr in data["warnings"]:
+                                    wi = warn_icons.get(wr.warning_type, "⚠️")
+                                    st.warning(f"**{wr.park_name}** — {wi} {wr.warning_type}: {wr.description}")
 
                     # ── EXPENSE TRACKER ─────────────────────────────────────
                     st.divider()
                     with st.expander("💰 Expense Tracker", expanded=False):
-                        with engine.connect() as conn2:
-                            expenses = conn2.execute(text("""
-                                SELECT te.id, te.day_number, te.category, te.description,
-                                       te.amount, u.firstname AS paid_by_name
-                                FROM trip_expenses te
-                                LEFT JOIN users u ON te.paid_by=u.id
-                                WHERE te.trip_id=:tid
-                                ORDER BY te.day_number, te.created_at
-                            """), {"tid": t.id}).fetchall()
-
+                        expenses = data["expenses"]
                         if expenses:
                             total = sum(e.amount for e in expenses)
                             cat_totals = {}
@@ -1885,8 +1959,8 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                             for e in expenses:
                                 exp_days.setdefault(e.day_number or 0, []).append(e)
                             for day_n, day_exps in sorted(exp_days.items()):
-                                label = f"Day {day_n}" if day_n else "General"
-                                st.markdown(f"**{label}**")
+                                elabel = f"Day {day_n}" if day_n else "General"
+                                st.markdown(f"**{elabel}**")
                                 for e in day_exps:
                                     ec1, ec2, ec3 = st.columns([4, 2, 1])
                                     ec1.caption(f"{e.category}: {e.description or '—'}")
@@ -1894,39 +1968,34 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                     if editable and ec3.button("✕", key=f"del_exp_{e.id}"):
                                         with engine.begin() as conn2:
                                             conn2.execute(text("DELETE FROM trip_expenses WHERE id=:id"), {"id": e.id})
+                                        invalidate_trip_data(t.id)
                                         st.rerun()
 
                         if editable:
                             st.divider()
                             st.caption("**Add expense:**")
                             view_days_exp = date_range_days(t.start_date, t.end_date)
-                            ea1, ea2, ea3, ea4, ea5 = st.columns([2, 2, 2, 2, 1])
-                            exp_cat  = ea1.selectbox("Category", ["Food", "Gas", "Lodging", "Fees", "Gear", "Other"], key=f"exp_cat_{t.id}")
-                            exp_desc = ea2.text_input("Description", key=f"exp_desc_{t.id}")
-                            exp_amt  = ea3.number_input("Amount ($)", min_value=0.0, step=0.01, format="%.2f", key=f"exp_amt_{t.id}")
-                            exp_day  = ea4.selectbox("Day", [0] + [d[0] for d in view_days_exp],
-                                                     format_func=lambda d: "General" if d == 0 else f"Day {d}",
-                                                     key=f"exp_day_{t.id}")
-                            if ea5.button("Add", key=f"add_exp_{t.id}") and exp_amt > 0:
+                            with st.form(f"add_expense_form_{t.id}"):
+                                ea1, ea2, ea3, ea4 = st.columns([2, 2, 2, 2])
+                                exp_cat = ea1.selectbox("Category", ["Food", "Gas", "Lodging", "Fees", "Gear", "Other"])
+                                exp_desc = ea2.text_input("Description")
+                                exp_amt = ea3.number_input("Amount ($)", min_value=0.0, step=0.01, format="%.2f")
+                                exp_day = ea4.selectbox("Day", [0] + [d[0] for d in view_days_exp],
+                                                         format_func=lambda d: "General" if d == 0 else f"Day {d}")
+                                add_exp = st.form_submit_button("Add")
+                            if add_exp and exp_amt > 0:
                                 with engine.begin() as conn2:
                                     conn2.execute(text("""
                                         INSERT INTO trip_expenses (trip_id, day_number, category, description, amount, paid_by)
                                         VALUES (:tid, :day, :cat, :desc, :amt, :uid)
                                     """), {"tid": t.id, "day": exp_day if exp_day else None,
                                            "cat": exp_cat, "desc": exp_desc, "amt": exp_amt, "uid": current_uid})
+                                invalidate_trip_data(t.id)
                                 st.rerun()
 
                     # ── PERMIT TRACKER ───────────────────────────────────────
                     with st.expander("🎫 Permit Tracker", expanded=False):
-                        with engine.connect() as conn2:
-                            permits = conn2.execute(text("""
-                                SELECT tp2.id, tp2.permit_name, p.name AS park_name,
-                                       tp2.required_by, tp2.secured, tp2.notes
-                                FROM trip_permits tp2
-                                LEFT JOIN parks p ON tp2.park_id=p.id
-                                WHERE tp2.trip_id=:tid ORDER BY tp2.required_by NULLS LAST
-                            """), {"tid": t.id}).fetchall()
-
+                        permits = data["permits"]
                         if permits:
                             for pm in permits:
                                 pm1, pm2, pm3 = st.columns([5, 2, 1])
@@ -1940,10 +2009,12 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                     with engine.begin() as conn2:
                                         conn2.execute(text("UPDATE trip_permits SET secured=:s WHERE id=:id"),
                                                       {"s": not pm.secured, "id": pm.id})
+                                    invalidate_trip_data(t.id)
                                     st.rerun()
                                 if editable and pm3.button("✕", key=f"del_permit_{pm.id}"):
                                     with engine.begin() as conn2:
                                         conn2.execute(text("DELETE FROM trip_permits WHERE id=:id"), {"id": pm.id})
+                                    invalidate_trip_data(t.id)
                                     st.rerun()
                         elif not editable:
                             st.caption("No permits tracked for this trip.")
@@ -1951,14 +2022,14 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                         if editable:
                             st.divider()
                             st.caption("**Add permit:**")
-                            with engine.connect() as conn2:
-                                tp_parks = get_trip_parks(conn2, t.id)
-                            pa1, pa2, pa3, pa4 = st.columns([3, 2, 2, 1])
-                            perm_name = pa1.text_input("Permit name", key=f"perm_name_{t.id}")
-                            perm_park_opts = {tp_r.park_name: tp_r.park_id for tp_r in tp_parks}
-                            perm_park = pa2.selectbox("Park", ["General"] + list(perm_park_opts.keys()), key=f"perm_park_{t.id}")
-                            perm_due  = pa3.date_input("Required by", value=None, key=f"perm_due_{t.id}")
-                            if pa4.button("Add", key=f"add_perm_{t.id}") and perm_name:
+                            perm_park_opts = {tp_r.park_name: tp_r.park_id for tp_r in data["trip_parks"]}
+                            with st.form(f"add_permit_form_{t.id}"):
+                                pa1, pa2, pa3 = st.columns([3, 2, 2])
+                                perm_name = pa1.text_input("Permit name")
+                                perm_park = pa2.selectbox("Park", ["General"] + list(perm_park_opts.keys()))
+                                perm_due = pa3.date_input("Required by", value=None)
+                                add_perm = st.form_submit_button("Add")
+                            if add_perm and perm_name:
                                 with engine.begin() as conn2:
                                     conn2.execute(text("""
                                         INSERT INTO trip_permits (trip_id, park_id, permit_name, required_by)
@@ -1966,6 +2037,7 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                     """), {"tid": t.id,
                                            "pid": perm_park_opts.get(perm_park) if perm_park != "General" else None,
                                            "name": perm_name, "due": perm_due if perm_due else None})
+                                invalidate_trip_data(t.id)
                                 st.rerun()
 
                     # ── RATING & REVIEW (past trips) ─────────────────────────
@@ -1973,19 +2045,20 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                         st.divider()
                         st.markdown("**⭐ Rate & Review This Trip**")
                         current_rating = t.rating or 0
-                        new_rating = st.select_slider(
-                            "Rating", options=[1, 2, 3, 4, 5],
-                            value=current_rating if current_rating > 0 else 3,
-                            format_func=lambda x: "⭐" * x,
-                            key=f"rating_{t.id}"
-                        )
-                        new_review = st.text_area("Write a review (optional)",
-                                                   value=t.review_text or "",
-                                                   placeholder="What made this trip memorable? Tips for others?",
-                                                   height=100, key=f"review_{t.id}")
-                        is_public_now = st.checkbox("🌐 Make this trip public in the community feed",
-                                                     value=bool(t.is_public), key=f"ispub_{t.id}")
-                        if st.button("💾 Save Rating & Review", key=f"save_rating_{t.id}"):
+                        with st.form(f"rating_form_{t.id}"):
+                            new_rating = st.select_slider(
+                                "Rating", options=[1, 2, 3, 4, 5],
+                                value=current_rating if current_rating > 0 else 3,
+                                format_func=lambda x: "⭐" * x,
+                            )
+                            new_review = st.text_area("Write a review (optional)",
+                                                       value=t.review_text or "",
+                                                       placeholder="What made this trip memorable? Tips for others?",
+                                                       height=100)
+                            is_public_now = st.checkbox("🌐 Make this trip public in the community feed",
+                                                         value=bool(t.is_public))
+                            save_rating = st.form_submit_button("💾 Save Rating & Review")
+                        if save_rating:
                             with engine.begin() as conn2:
                                 conn2.execute(text("""
                                     UPDATE trips SET rating=:r, review_text=:rv, is_public=:pub WHERE id=:tid
@@ -1995,12 +2068,9 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                             st.rerun()
 
     # ─────────────────────────────────────────────
-    # PASSPORT TAB — Choropleth map + park grid
+    # PASSPORT TAB — park grid (map removed)
     # ─────────────────────────────────────────────
     with passport_tab:
-        import plotly.express as px
-        import plotly.graph_objects as go
-
         st.header("🗺 National Park Passport")
         st.caption("Track every park you've visited across the US.")
 
@@ -2015,49 +2085,24 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                 ORDER BY p.state, p.name
             """), {"uid": current_uid}).fetchall()
 
-            all_parks_pass = conn2.execute(text("SELECT id, name, state FROM parks ORDER BY state, name")).fetchall()
-
+        all_parks_pass_df = get_park_name_id_df()  # cached
         visited_ids = {r.id for r in visited_rows}
         visited_states = list({r.state for r in visited_rows if r.state})
 
-        # ── Choropleth ───────────────────────────────────────────────────────
-        state_visit_count = {}
-        for r in visited_rows:
-            if r.state:
-                state_visit_count[r.state] = state_visit_count.get(r.state, 0) + 1
-
-        all_states = list({r.state for r in all_parks_pass if r.state})
-        fig = go.Figure(data=go.Choropleth(
-            locations=[s for s in all_states],
-            z=[state_visit_count.get(s, 0) for s in all_states],
-            locationmode='USA-states',
-            colorscale=[[0, '#e8f5e9'], [0.01, '#a5d6a7'], [0.5, '#388e3c'], [1.0, '#1b5e20']],
-            zmin=0,
-            colorbar=dict(title="Parks visited", thickness=15, len=0.5),
-            hovertemplate='<b>%{location}</b><br>Parks visited: %{z}<extra></extra>',
-        ))
-        fig.update_layout(
-            geo=dict(scope='usa', showlakes=True, lakecolor='lightblue',
-                     bgcolor='rgba(0,0,0,0)', landcolor='#f5f5f5'),
-            margin=dict(l=0, r=0, t=10, b=0),
-            height=380,
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Stats row
         s1, s2, s3 = st.columns(3)
         s1.metric("Parks Visited", len(visited_ids))
         s2.metric("States Explored", len(visited_states))
-        s3.metric("Total Parks", len(all_parks_pass))
-        st.progress(len(visited_ids) / max(len(all_parks_pass), 1),
-                    text=f"{len(visited_ids)} / {len(all_parks_pass)} parks ({len(visited_ids)/max(len(all_parks_pass),1)*100:.0f}%)")
+        s3.metric("Total Parks", len(all_parks_pass_df))
+        total_parks_n = max(len(all_parks_pass_df), 1)
+        st.progress(len(visited_ids) / total_parks_n,
+                    text=f"{len(visited_ids)} / {len(all_parks_pass_df)} parks ({len(visited_ids)/total_parks_n*100:.0f}%)")
+
+        if visited_states:
+            st.caption("📍 States explored: " + ", ".join(sorted(visited_states)))
 
         st.divider()
 
-        # ── Park grid ────────────────────────────────────────────────────────
-        tab_vis, tab_unvis = st.tabs([f"✅ Visited ({len(visited_ids)})", f"🔲 Not Yet ({len(all_parks_pass)-len(visited_ids)})"])
+        tab_vis, tab_unvis = st.tabs([f"✅ Visited ({len(visited_ids)})", f"🔲 Not Yet ({len(all_parks_pass_df)-len(visited_ids)})"])
         with tab_vis:
             if not visited_rows:
                 st.info("No parks visited yet — plan your first trip!")
@@ -2072,15 +2117,16 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                 st.caption(f"✅ **{row.name}**")
                                 st.caption(f"📍 {row.state}")
         with tab_unvis:
-            unvisited = [r for r in all_parks_pass if r.id not in visited_ids]
-            for i in range(0, len(unvisited), 4):
+            unvisited = all_parks_pass_df[~all_parks_pass_df['id'].isin(visited_ids)]
+            unvisited_records = unvisited.to_dict('records')
+            for i in range(0, len(unvisited_records), 4):
                 cols = st.columns(4)
-                for col, row in zip(cols, unvisited[i:i+4]):
+                for col, row in zip(cols, unvisited_records[i:i+4]):
                     with col:
-                        st.caption(f"🔲 **{row.name}**  \n📍 {row.state}")
+                        st.caption(f"🔲 **{row['name']}**  \n📍 {row['state']}")
 
     # ─────────────────────────────────────────────
-    # DISCOVER TAB — Public feed + Friend feed + Park Recommendations + Challenges
+    # DISCOVER TAB
     # ─────────────────────────────────────────────
     with discover_tab:
         st.header("🌍 Discover")
@@ -2088,7 +2134,6 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
             "🌐 Public Trips", "👥 Friend Activity", "💡 Recommended Parks", "🏆 Challenges"
         ])
 
-        # ── PUBLIC TRIP FEED ────────────────────────────────────────────────
         with disc_tab1:
             st.subheader("🌐 Community Trip Feed")
             st.caption("Trips marked public by the community. Get inspired!")
@@ -2126,7 +2171,6 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                         st.caption(f"🏔️ {pt.park_names or 'Parks not listed'}")
                         if pt.review_text:
                             st.markdown(f"> {pt.review_text}")
-                        # Inspire button
                         if st.button("✨ Use as Inspiration", key=f"inspire_{pt.id}"):
                             with engine.connect() as conn2:
                                 inspire_parks = conn2.execute(text("""
@@ -2137,7 +2181,6 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                             st.session_state.active_parks_saved = [r.name for r in inspire_parks]
                             st.success("Parks loaded! Switch to Plan Trip to continue.")
 
-        # ── FRIEND ACTIVITY FEED ────────────────────────────────────────────
         with disc_tab2:
             st.subheader("👥 Friend Activity")
             with engine.connect() as conn2:
@@ -2179,7 +2222,6 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                         st.caption(f"👤 {fa.firstname} {fa.lastname}  •  🏔️ {fa.park_names or '—'}")
                         st.caption(f"📅 {fa.start_date} → {fa.end_date}")
 
-        # ── PARK RECOMMENDATIONS ────────────────────────────────────────────
         with disc_tab3:
             st.subheader("💡 Parks You Might Love")
             st.caption("Based on the parks you've already visited.")
@@ -2203,7 +2245,6 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
             if not visited_park_ids_rec:
                 st.info("Visit some parks first and we'll recommend similar ones!")
             else:
-                # Recommend parks in states the user has visited but hasn't seen yet
                 with engine.connect() as conn2:
                     if visited_states_rec:
                         recs = conn2.execute(text("""
@@ -2219,7 +2260,6 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                     else:
                         recs = []
 
-                    # Fill up to 9 with popular parks not yet visited
                     if len(recs) < 9:
                         already = {r.id for r in recs} | set(visited_park_ids_rec)
                         extra = conn2.execute(text("""
@@ -2250,26 +2290,21 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                     st.session_state.active_parks_saved = [r.name]
                                     st.success(f"Loaded {r.name}! Switch to Plan Trip.")
 
-        # ── CHALLENGES ──────────────────────────────────────────────────────
         with disc_tab4:
             st.subheader("🏆 Bucket List Challenges")
 
+            challenge_defs = get_challenge_definitions()  # cached
             with engine.connect() as conn2:
-                all_challenges = conn2.execute(text("""
-                    SELECT c.*, ucp.completed, ucp.completed_at
-                    FROM challenges c
-                    LEFT JOIN user_challenge_progress ucp
-                      ON c.id=ucp.challenge_id AND ucp.user_id=:uid
-                    ORDER BY c.sort_order
+                progress_rows = conn2.execute(text("""
+                    SELECT challenge_id, completed, completed_at
+                    FROM user_challenge_progress WHERE user_id=:uid
                 """), {"uid": current_uid}).fetchall()
-
                 user_visited_ids = set(r[0] for r in conn2.execute(text("""
                     SELECT DISTINCT tpk.park_id FROM trip_parks tpk
                     JOIN trips t ON tpk.trip_id=t.id
                     JOIN trip_participants tp ON t.id=tp.trip_id
                     WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
                 """), {"uid": current_uid}).fetchall())
-
                 user_visited_states = set(r[0] for r in conn2.execute(text("""
                     SELECT DISTINCT p.state FROM parks p
                     JOIN trip_parks tpk ON p.id=tpk.park_id
@@ -2278,8 +2313,9 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                     WHERE tp.user_id=:uid AND tp.invitation_status='accepted' AND p.state IS NOT NULL
                 """), {"uid": current_uid}).fetchall())
 
+            progress_map = {r.challenge_id: r for r in progress_rows}
+
             def check_challenge_progress(c):
-                """Return (completed_count, total_needed) for a challenge."""
                 if c.required_park_ids:
                     done = sum(1 for pid in c.required_park_ids if pid in user_visited_ids)
                     return done, len(c.required_park_ids)
@@ -2290,10 +2326,14 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                     return min(len(user_visited_ids), c.required_count), c.required_count
                 return 0, 1
 
-            # Auto-complete newly finished challenges
-            for c in all_challenges:
+            newly_completed = []
+            all_challenges = []
+            for c in challenge_defs:
+                prog = progress_map.get(c.id)
+                completed = bool(prog.completed) if prog else False
+                completed_at = prog.completed_at if prog else None
                 done, total = check_challenge_progress(c)
-                if done >= total and not c.completed:
+                if done >= total and not completed:
                     with engine.begin() as conn2:
                         conn2.execute(text("""
                             INSERT INTO user_challenge_progress (user_id, challenge_id, completed, completed_at)
@@ -2301,10 +2341,15 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                             ON CONFLICT (user_id, challenge_id) DO UPDATE
                               SET completed=TRUE, completed_at=NOW()
                         """), {"uid": current_uid, "cid": c.id})
-                    st.toast(f"🏆 Challenge complete: {c.icon} {c.name}!", icon="🎉")
+                    completed = True
+                    newly_completed.append(c)
+                all_challenges.append((c, completed, completed_at))
 
-            completed_chall = [c for c in all_challenges if c.completed]
-            in_progress = [c for c in all_challenges if not c.completed]
+            for c in newly_completed:
+                st.toast(f"🏆 Challenge complete: {c.icon} {c.name}!", icon="🎉")
+
+            completed_chall = [(c, ca) for c, comp, ca in all_challenges if comp]
+            in_progress = [c for c, comp, ca in all_challenges if not comp]
 
             st.caption(f"**{len(completed_chall)}/{len(all_challenges)}** challenges completed")
             st.progress(len(completed_chall) / max(len(all_challenges), 1))
@@ -2321,9 +2366,9 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
 
             if completed_chall:
                 st.markdown("**Completed 🎉:**")
-                for c in completed_chall:
+                for c, completed_at in completed_chall:
                     with st.container(border=True):
-                        ts = c.completed_at.strftime("%b %d, %Y") if c.completed_at and hasattr(c.completed_at, 'strftime') else ""
+                        ts = completed_at.strftime("%b %d, %Y") if completed_at and hasattr(completed_at, 'strftime') else ""
                         st.markdown(f"{c.icon} ~~{c.name}~~ ✅  \n_{c.description}_  \n<small>Completed {ts}</small>", unsafe_allow_html=True)
 
     # ─────────────────────────────────────────────
@@ -2374,11 +2419,10 @@ SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc
                                             conn2.execute(text("DELETE FROM gear_template_items WHERE id=:id"), {"id": it.id})
                                         st.rerun()
 
-                        # Add item inline
                         st.divider()
                         ai1, ai2, ai3 = st.columns([3, 2, 1])
                         new_item_name = ai1.text_input("Item", key=f"new_gti_name_{gt.id}")
-                        new_item_cat  = ai2.selectbox("Category", ["Clothing", "Footwear", "Navigation", "Safety",
+                        new_item_cat = ai2.selectbox("Category", ["Clothing", "Footwear", "Navigation", "Safety",
                             "Camping/Shelter", "Food & Water", "Photography", "Personal Care", "Documents", "Other"],
                             key=f"new_gti_cat_{gt.id}")
                         if ai3.button("Add", key=f"add_gti_{gt.id}") and new_item_name:
