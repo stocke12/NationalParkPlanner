@@ -11,9 +11,9 @@ from sqlalchemy import text
 from database import get_connection
 from fpdf import FPDF
 
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════
 # SETUP
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
@@ -21,47 +21,60 @@ if not GEMINI_API_KEY:
     st.stop()
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-
 st.set_page_config(page_title="National Park Planner", page_icon="🌲", layout="wide")
 
-for key, val in {
-    "logged_in": False,
-    "user_info": None,
-    "temp_activities": [],
-    "master_itinerary": "",
-    "day_activities": {},
-    "nights": 0,
-    "trip_start": None,
-    "trip_end": None,
-    "activity_day_defaults": {},
-    "park_distances": [],
-    "conflict_warnings": {},
-    "active_parks_saved": [],
-    "auth_screen": "login",
-    "pending_uid": None,
-    "badges_checked_session": False,
-}.items():
+SECTIONS = [
+    "🗺️ Plan Trip", "🔭 Park Explorer", "👥 Friends", "🎒 My Trips", "📊 My Stats",
+    "🗺 Passport", "🌍 Discover", "🎒 Gear", "🔔 Notifications",
+]
+
+DEFAULTS = {
+    "logged_in": False, "user_info": None, "temp_activities": [], "master_itinerary": "",
+    "day_activities": {}, "nights": 0, "trip_start": None, "trip_end": None,
+    "activity_day_defaults": {}, "park_distances": [], "conflict_warnings": {},
+    "active_parks_saved": [], "auth_screen": "login", "pending_uid": None,
+    "badges_checked_session": False, "challenges_checked_session": False,
+    "active_section": SECTIONS[0],
+}
+for key, val in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = val
+
 
 @st.cache_resource
 def get_engine():
     return get_connection()
 
+
 engine = get_engine()
 
+# ═════════════════════════════════════════════════════════════════════════
+# WHY THIS FILE LOOKS DIFFERENT FROM A "NORMAL" STREAMLIT APP
+# ═════════════════════════════════════════════════════════════════════════
+# Streamlit reruns the ENTIRE script top-to-bottom on every interaction.
+# st.tabs() does NOT skip building the tabs you're not looking at — every
+# `with tab:` block still executes its queries on every rerun, no matter
+# which tab is visible. That was the single biggest cost in this app: a
+# keystroke in the Friends search box was also re-running Stats, Passport,
+# Discover's challenge logic, Notifications, etc.
+#
+# Fix: pick ONE active section per rerun (a radio button, not st.tabs) and
+# only call that section's render function. Every other section's queries
+# simply never run.
+#
+# On top of that: every read query used anywhere in a section is wrapped in
+# @st.cache_data with a TTL and the user id as a cache key, so switching
+# back to a section you already visited this session is instant instead of
+# re-hitting Postgres. Mutations call `.clear()` on the specific cache(s)
+# they invalidate, right before st.rerun().
+# ═════════════════════════════════════════════════════════════════════════
+
 # ─────────────────────────────────────────────
-# CACHED / SHARED READS
+# CACHED READS — GLOBAL (rarely change)
 # ─────────────────────────────────────────────
-# These queries rarely change between reruns, so instead of hitting the DB
-# on every widget interaction (Streamlit reruns the WHOLE script top to
-# bottom on every click, in every tab, not just the one you touched), we
-# cache them for a short TTL and re-derive per-user bits (wishlist, role,
-# etc.) separately and cheaply.
 
 @st.cache_data(ttl=600)
 def get_parks_with_details():
-    """Static-ish park catalogue + details. Cached — this almost never changes."""
     with engine.connect() as conn:
         return pd.read_sql(text("""
             SELECT p.id, p.name, p.state, p.image_url,
@@ -72,27 +85,444 @@ def get_parks_with_details():
             ORDER BY p.name
         """), conn)
 
+
 @st.cache_data(ttl=60)
 def get_active_alerts_map():
     with engine.connect() as conn:
-        df = pd.read_sql(text("""
-            SELECT park_id, COUNT(*) AS alert_count FROM alerts WHERE isactive=TRUE GROUP BY park_id
-        """), conn)
+        df = pd.read_sql(text(
+            "SELECT park_id, COUNT(*) AS alert_count FROM alerts WHERE isactive=TRUE GROUP BY park_id"
+        ), conn)
     return dict(zip(df['park_id'], df['alert_count'])) if not df.empty else {}
+
+
+@st.cache_data(ttl=60)
+def get_alerts_for_parks(park_ids: tuple):
+    """Batched — replaces the old one-query-per-park-card pattern."""
+    if not park_ids:
+        return {}
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT park_id, title, category, description FROM alerts
+            WHERE park_id = ANY(:pids) AND isactive=TRUE
+        """), {"pids": list(park_ids)}).fetchall()
+    out = {}
+    for r in rows:
+        out.setdefault(r.park_id, []).append(r)
+    return out
+
 
 @st.cache_data(ttl=600)
 def get_park_name_id_df():
     with engine.connect() as conn:
         return pd.read_sql(text("SELECT name, id, state FROM parks ORDER BY name"), conn)
 
+
 @st.cache_data(ttl=600)
 def get_challenge_definitions():
     with engine.connect() as conn:
         return conn.execute(text("SELECT * FROM challenges ORDER BY sort_order")).fetchall()
 
-def mark_badges_dirty():
-    """Call after any action that could earn a badge (trip saved, friend added, etc.)."""
-    st.session_state["badges_checked_session"] = False
+
+# ─────────────────────────────────────────────
+# CACHED READS — PER USER (short TTL, uid-keyed, explicitly busted on write)
+# ─────────────────────────────────────────────
+
+@st.cache_data(ttl=20)
+def get_pending_count(uid):
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT
+                (SELECT COUNT(*) FROM friendships WHERE friend_id=:uid AND status='pending') +
+                (SELECT COUNT(*) FROM trip_participants WHERE user_id=:uid AND invitation_status='pending' AND role!='owner')
+            AS total
+        """), {"uid": uid}).scalar()
+    return result or 0
+
+
+@st.cache_data(ttl=20)
+def get_notifications_data(uid):
+    with engine.connect() as conn:
+        friend_reqs = conn.execute(text("""
+            SELECT f.id, u.firstname, u.lastname, u.username, f.status
+            FROM friendships f JOIN users u ON f.user_id=u.id
+            WHERE f.friend_id=:uid AND f.status='pending' ORDER BY f.id DESC
+        """), {"uid": uid}).fetchall()
+        trip_invites = conn.execute(text("""
+            SELECT tp.id AS participant_id, t.id AS trip_id, t.trip_name,
+                   t.start_date, t.end_date,
+                   u_owner.firstname || ' ' || u_owner.lastname AS invited_by_name,
+                   STRING_AGG(p.name, ', ' ORDER BY p.name) AS park_names
+            FROM trip_participants tp
+            JOIN trips t ON tp.trip_id = t.id
+            JOIN users u_owner ON t.owner_id = u_owner.id
+            LEFT JOIN trip_parks tpk ON t.id = tpk.trip_id
+            LEFT JOIN parks p ON tpk.park_id = p.id
+            WHERE tp.user_id = :uid AND tp.invitation_status = 'pending' AND tp.role != 'owner'
+            GROUP BY tp.id, t.id, t.trip_name, t.start_date, t.end_date, u_owner.firstname, u_owner.lastname
+        """), {"uid": uid}).fetchall()
+        recent_notes = conn.execute(text("""
+            SELECT tdn.id, tdn.trip_id, tdn.day_number, tdn.note_text, tdn.created_at,
+                   u.firstname, u.lastname, t.trip_name
+            FROM trip_day_notes tdn
+            JOIN users u ON tdn.author_id=u.id
+            JOIN trips t ON tdn.trip_id=t.id
+            JOIN trip_participants tp ON t.id=tp.trip_id
+            WHERE tp.user_id=:uid AND tdn.author_id!=:uid
+              AND tdn.created_at > NOW() - INTERVAL '7 days'
+            ORDER BY tdn.created_at DESC LIMIT 20
+        """), {"uid": uid}).fetchall()
+    return {"friend_reqs": friend_reqs, "trip_invites": trip_invites, "recent_notes": recent_notes}
+
+
+@st.cache_data(ttl=120)
+def get_wishlist_ids(uid):
+    with engine.connect() as conn:
+        return {r[0] for r in conn.execute(
+            text("SELECT park_id FROM park_wishlists WHERE user_id=:uid"), {"uid": uid}).fetchall()}
+
+
+@st.cache_data(ttl=60)
+def get_friends(uid):
+    with engine.connect() as conn:
+        return conn.execute(text("""
+            SELECT u.id, u.username, u.firstname, u.likes, f.id AS friendship_id
+            FROM users u JOIN friendships f ON (u.id=f.friend_id OR u.id=f.user_id)
+            WHERE (f.user_id=:uid OR f.friend_id=:uid) AND f.status='accepted' AND u.id!=:uid
+        """), {"uid": uid}).fetchall()
+
+
+@st.cache_data(ttl=20)
+def get_incoming_friend_requests(uid):
+    with engine.connect() as conn:
+        return conn.execute(text("""
+            SELECT f.id, u.username, u.firstname, u.lastname FROM friendships f
+            JOIN users u ON f.user_id=u.id WHERE f.friend_id=:uid AND f.status='pending'
+        """), {"uid": uid}).fetchall()
+
+
+@st.cache_data(ttl=300)
+def search_users(uid, query):
+    with engine.connect() as conn:
+        return conn.execute(text("""
+            SELECT u.id, u.username, u.firstname, u.lastname, u.likes,
+                CASE
+                    WHEN f.id IS NOT NULL AND f.status='accepted' THEN 'friends'
+                    WHEN f.id IS NOT NULL AND f.status='pending' AND f.user_id=:uid THEN 'request_sent'
+                    WHEN f.id IS NOT NULL AND f.status='pending' AND f.friend_id=:uid THEN 'request_received'
+                    ELSE 'none'
+                END AS friendship_status
+            FROM users u
+            LEFT JOIN friendships f ON (f.user_id=:uid AND f.friend_id=u.id) OR (f.friend_id=:uid AND f.user_id=u.id)
+            WHERE u.id!=:uid
+              AND (LOWER(u.username) LIKE LOWER(:q) OR LOWER(u.firstname) LIKE LOWER(:q) OR LOWER(u.lastname) LIKE LOWER(:q))
+            ORDER BY u.firstname, u.lastname LIMIT 20
+        """), {"uid": uid, "q": f"%{query}%"}).fetchall()
+
+
+@st.cache_data(ttl=120)
+def get_friend_options(uid):
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT u.id, u.username FROM users u
+            JOIN friendships f ON (u.id=f.friend_id OR u.id=f.user_id)
+            WHERE ((f.user_id=:uid OR f.friend_id=:uid) AND f.status='accepted') AND u.id!=:uid
+        """), {"uid": uid}).fetchall()
+    return {r.username: r.id for r in rows}
+
+
+@st.cache_data(ttl=300)
+def get_templates(uid):
+    with engine.connect() as conn:
+        return conn.execute(text("""
+            SELECT t.id, t.trip_name, t.start_date, t.end_date,
+                   STRING_AGG(p.name, ', ' ORDER BY p.name) AS park_names
+            FROM trips t JOIN trip_participants tp ON t.id=tp.trip_id
+            LEFT JOIN trip_parks tpk ON t.id=tpk.trip_id LEFT JOIN parks p ON tpk.park_id=p.id
+            WHERE tp.user_id=:uid AND t.is_template=TRUE AND tp.role='owner'
+            GROUP BY t.id, t.trip_name, t.start_date, t.end_date ORDER BY t.trip_name
+        """), {"uid": uid}).fetchall()
+
+
+@st.cache_data(ttl=60)
+def get_my_trips(uid):
+    with engine.connect() as conn:
+        return conn.execute(text("""
+            SELECT DISTINCT t.id, t.trip_name, t.start_date, t.end_date,
+                   STRING_AGG(DISTINCT p.name, ', ' ORDER BY p.name) AS park_names,
+                   STRING_AGG(DISTINCT p.image_url, '|' ORDER BY p.image_url) AS park_images,
+                   u_owner.firstname || ' ' || u_owner.lastname AS owner_name,
+                   tp.role, t.recap_text, t.rating, t.review_text, t.is_public
+            FROM trips t
+            JOIN trip_participants tp ON t.id=tp.trip_id
+            JOIN users u_owner ON t.owner_id=u_owner.id
+            LEFT JOIN trip_parks tpk ON t.id=tpk.trip_id
+            LEFT JOIN parks p ON tpk.park_id=p.id
+            WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
+              AND (t.is_template IS NULL OR t.is_template=FALSE)
+            GROUP BY t.id, t.trip_name, t.start_date, t.end_date, u_owner.firstname, u_owner.lastname,
+                     tp.role, t.recap_text, t.rating, t.review_text, t.is_public
+            ORDER BY t.start_date DESC
+        """), {"uid": uid}).fetchall()
+
+
+@st.cache_data(ttl=60)
+def load_trip_heavy_data(tid, start_d):
+    """One-shot bundle of everything a single trip's detail view needs."""
+    with engine.connect() as conn:
+        saved_acts = conn.execute(text("""
+            SELECT id, day_number, activity_name, activity_type, sort_order
+            FROM trip_activities WHERE trip_id=:tid ORDER BY day_number, sort_order
+        """), {"tid": tid}).fetchall()
+
+        all_notes_rows = conn.execute(text("""
+            SELECT tdn.id, tdn.day_number, tdn.note_text, tdn.created_at,
+                   u.firstname, u.lastname, tdn.author_id
+            FROM trip_day_notes tdn JOIN users u ON tdn.author_id=u.id
+            WHERE tdn.trip_id=:tid ORDER BY tdn.day_number, tdn.created_at
+        """), {"tid": tid}).fetchall()
+
+        trip_parks_rows = conn.execute(text("""
+            SELECT tpk.id AS trip_park_id, tpk.park_id, p.name AS park_name, p.image_url, tpk.notes
+            FROM trip_parks tpk JOIN parks p ON tpk.park_id = p.id
+            WHERE tpk.trip_id = :tid ORDER BY p.name
+        """), {"tid": tid}).fetchall()
+        park_ids = [tp.park_id for tp in trip_parks_rows]
+
+        trip_alerts, crowd_rows, warn_rows = [], [], []
+        if park_ids:
+            trip_alerts = conn.execute(text("""
+                SELECT a.title, a.category, a.description, p.name AS park_name
+                FROM alerts a JOIN parks p ON a.park_id=p.id
+                WHERE a.park_id=ANY(:pids) AND a.isactive=TRUE
+                ORDER BY p.name, a.category
+            """), {"pids": park_ids}).fetchall()
+
+            trip_month = start_d.month if start_d else None
+            if trip_month:
+                crowd_rows = conn.execute(text("""
+                    SELECT p.name AS park_name, pcc.crowd_level, pcc.notes
+                    FROM park_crowd_calendar pcc JOIN parks p ON pcc.park_id=p.id
+                    WHERE pcc.park_id=ANY(:pids) AND pcc.month=:m ORDER BY p.name
+                """), {"pids": park_ids, "m": trip_month}).fetchall()
+                warn_rows = conn.execute(text("""
+                    SELECT p.name AS park_name, psw.warning_type, psw.description
+                    FROM park_seasonal_warnings psw JOIN parks p ON psw.park_id=p.id
+                    WHERE psw.park_id=ANY(:pids)
+                      AND ((psw.month_start <= psw.month_end AND :m BETWEEN psw.month_start AND psw.month_end)
+                           OR (psw.month_start > psw.month_end AND (:m >= psw.month_start OR :m <= psw.month_end)))
+                    ORDER BY p.name
+                """), {"pids": park_ids, "m": trip_month}).fetchall()
+
+        packing_rows = conn.execute(text("""
+            SELECT id, category, item_name, is_checked FROM trip_packing_items
+            WHERE trip_id=:tid ORDER BY category, item_name
+        """), {"tid": tid}).fetchall()
+
+        expenses = conn.execute(text("""
+            SELECT te.id, te.day_number, te.category, te.description, te.amount, u.firstname AS paid_by_name
+            FROM trip_expenses te LEFT JOIN users u ON te.paid_by=u.id
+            WHERE te.trip_id=:tid ORDER BY te.day_number, te.created_at
+        """), {"tid": tid}).fetchall()
+
+        permits = conn.execute(text("""
+            SELECT tp2.id, tp2.permit_name, p.name AS park_name, tp2.required_by, tp2.secured, tp2.notes
+            FROM trip_permits tp2 LEFT JOIN parks p ON tp2.park_id=p.id
+            WHERE tp2.trip_id=:tid ORDER BY tp2.required_by NULLS LAST
+        """), {"tid": tid}).fetchall()
+
+        participants = conn.execute(text("""
+            SELECT u.firstname, u.lastname, u.username, tp.role, tp.invitation_status
+            FROM trip_participants tp JOIN users u ON tp.user_id=u.id
+            WHERE tp.trip_id=:tid ORDER BY tp.role
+        """), {"tid": tid}).fetchall()
+
+    return {
+        "acts": saved_acts, "notes": all_notes_rows, "trip_parks": trip_parks_rows,
+        "alerts": trip_alerts, "crowd": crowd_rows, "warnings": warn_rows,
+        "packing": packing_rows, "expenses": expenses, "permits": permits,
+        "participants": participants,
+    }
+
+
+@st.cache_data(ttl=120)
+def get_stats(uid):
+    with engine.connect() as conn:
+        trip_count = conn.execute(text("""
+            SELECT COUNT(*) FROM trips t JOIN trip_participants tp ON t.id=tp.trip_id
+            WHERE tp.user_id=:uid AND tp.invitation_status='accepted' AND tp.role='owner'
+        """), {"uid": uid}).scalar() or 0
+        parks_visited = conn.execute(text("""
+            SELECT DISTINCT p.id, p.name, p.state FROM parks p
+            JOIN trip_parks tpk ON p.id=tpk.park_id JOIN trips t ON tpk.trip_id=t.id
+            JOIN trip_participants tp ON t.id=tp.trip_id
+            WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
+        """), {"uid": uid}).fetchall()
+        activity_count = conn.execute(text("""
+            SELECT COUNT(*) FROM trip_activities ta JOIN trips t ON ta.trip_id=t.id
+            JOIN trip_participants tp ON t.id=tp.trip_id
+            WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
+        """), {"uid": uid}).scalar() or 0
+        note_count = conn.execute(text("SELECT COUNT(*) FROM trip_day_notes WHERE author_id=:uid"), {"uid": uid}).scalar() or 0
+        friend_count = conn.execute(text("""
+            SELECT COUNT(*) FROM friendships WHERE (user_id=:uid OR friend_id=:uid) AND status='accepted'
+        """), {"uid": uid}).scalar() or 0
+        wishlist_count = conn.execute(text("SELECT COUNT(*) FROM park_wishlists WHERE user_id=:uid"), {"uid": uid}).scalar() or 0
+        earned_badges = conn.execute(text("""
+            SELECT badge_key, badge_name, badge_description, earned_at
+            FROM user_badges WHERE user_id=:uid ORDER BY earned_at DESC
+        """), {"uid": uid}).fetchall()
+    return {
+        "trip_count": trip_count, "parks_visited": parks_visited,
+        "states_visited": list({p.state for p in parks_visited if p.state}),
+        "activity_count": activity_count, "note_count": note_count,
+        "friend_count": friend_count, "wishlist_count": wishlist_count,
+        "earned_badges": earned_badges,
+    }
+
+
+@st.cache_data(ttl=120)
+def get_passport_data(uid):
+    with engine.connect() as conn:
+        visited_rows = conn.execute(text("""
+            SELECT DISTINCT p.id, p.name, p.state, p.image_url
+            FROM parks p
+            JOIN trip_parks tpk ON p.id=tpk.park_id
+            JOIN trips t ON tpk.trip_id=t.id
+            JOIN trip_participants tp ON t.id=tp.trip_id
+            WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
+            ORDER BY p.state, p.name
+        """), {"uid": uid}).fetchall()
+    return visited_rows
+
+
+@st.cache_data(ttl=180)
+def get_public_trips(exclude_uid):
+    with engine.connect() as conn:
+        return conn.execute(text("""
+            SELECT t.id, t.trip_name, t.start_date, t.end_date, t.rating, t.review_text,
+                   u.firstname, u.lastname, u.username,
+                   STRING_AGG(DISTINCT p.name, ', ' ORDER BY p.name) AS park_names,
+                   STRING_AGG(DISTINCT p.image_url, '|' ORDER BY p.image_url) AS park_images
+            FROM trips t
+            JOIN users u ON t.owner_id=u.id
+            LEFT JOIN trip_parks tpk ON t.id=tpk.trip_id
+            LEFT JOIN parks p ON tpk.park_id=p.id
+            WHERE t.is_public=TRUE AND t.owner_id!=:uid
+              AND (t.is_template IS NULL OR t.is_template=FALSE)
+            GROUP BY t.id, t.trip_name, t.start_date, t.end_date, t.rating, t.review_text,
+                     u.firstname, u.lastname, u.username
+            ORDER BY t.end_date DESC NULLS LAST LIMIT 30
+        """), {"uid": exclude_uid}).fetchall()
+
+
+@st.cache_data(ttl=180)
+def get_friend_activity(uid):
+    with engine.connect() as conn:
+        return conn.execute(text("""
+            SELECT t.id, t.trip_name, t.start_date, t.end_date, u.firstname, u.lastname,
+                   STRING_AGG(DISTINCT p.name, ', ' ORDER BY p.name) AS park_names,
+                   STRING_AGG(DISTINCT p.image_url, '|' ORDER BY p.image_url) AS park_images,
+                   tp_owner.role, t.rating
+            FROM trips t
+            JOIN trip_participants tp_owner ON t.id=tp_owner.trip_id AND tp_owner.role='owner'
+            JOIN users u ON tp_owner.user_id=u.id
+            LEFT JOIN trip_parks tpk ON t.id=tpk.trip_id
+            LEFT JOIN parks p ON tpk.park_id=p.id
+            WHERE tp_owner.user_id IN (
+                SELECT CASE WHEN f.user_id=:uid THEN f.friend_id ELSE f.user_id END
+                FROM friendships f WHERE (f.user_id=:uid OR f.friend_id=:uid) AND f.status='accepted'
+            )
+            AND (t.is_template IS NULL OR t.is_template=FALSE)
+            AND tp_owner.invitation_status='accepted'
+            GROUP BY t.id, t.trip_name, t.start_date, t.end_date, u.firstname, u.lastname, tp_owner.role, t.rating
+            ORDER BY t.start_date DESC NULLS LAST LIMIT 20
+        """), {"uid": uid}).fetchall()
+
+
+@st.cache_data(ttl=180)
+def get_recommended_parks(uid):
+    with engine.connect() as conn:
+        visited_park_ids = [r[0] for r in conn.execute(text("""
+            SELECT DISTINCT tpk.park_id FROM trip_parks tpk
+            JOIN trips t ON tpk.trip_id=t.id JOIN trip_participants tp ON t.id=tp.trip_id
+            WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
+        """), {"uid": uid}).fetchall()]
+        if not visited_park_ids:
+            return []
+        visited_states = [r[0] for r in conn.execute(text("""
+            SELECT DISTINCT p.state FROM parks p
+            JOIN trip_parks tpk ON p.id=tpk.park_id JOIN trips t ON tpk.trip_id=t.id
+            JOIN trip_participants tp ON t.id=tp.trip_id
+            WHERE tp.user_id=:uid AND tp.invitation_status='accepted' AND p.state IS NOT NULL
+        """), {"uid": uid}).fetchall()]
+
+        recs = []
+        if visited_states:
+            recs = conn.execute(text("""
+                SELECT p.id, p.name, p.state, p.image_url, pd.description, pd.entrance_fee_cost
+                FROM parks p LEFT JOIN park_details pd ON p.id=pd.park_id
+                WHERE p.id NOT IN :visited AND p.state IN :states
+                ORDER BY p.name LIMIT 9
+            """), {"visited": tuple(visited_park_ids) or (0,), "states": tuple(visited_states)}).fetchall()
+
+        if len(recs) < 9:
+            already = {r.id for r in recs} | set(visited_park_ids)
+            extra = conn.execute(text("""
+                SELECT p.id, p.name, p.state, p.image_url, pd.description, pd.entrance_fee_cost
+                FROM parks p LEFT JOIN park_details pd ON p.id=pd.park_id
+                WHERE p.id NOT IN :excl ORDER BY p.name LIMIT :lim
+            """), {"excl": tuple(already) or (0,), "lim": 9 - len(recs)}).fetchall()
+            recs = list(recs) + list(extra)
+    return recs
+
+
+@st.cache_data(ttl=120)
+def get_gear_templates(uid):
+    """Batched: one query for templates, one for ALL their items (no N+1)."""
+    with engine.connect() as conn:
+        templates = conn.execute(text("""
+            SELECT gt.id, gt.template_name, gt.is_public, COUNT(gti.id) AS item_count
+            FROM gear_templates gt
+            LEFT JOIN gear_template_items gti ON gt.id=gti.template_id
+            WHERE gt.user_id=:uid
+            GROUP BY gt.id, gt.template_name, gt.is_public
+            ORDER BY gt.template_name
+        """), {"uid": uid}).fetchall()
+        ids = [t.id for t in templates]
+        items_by_template = {}
+        if ids:
+            items = conn.execute(text("""
+                SELECT id, template_id, category, item_name FROM gear_template_items
+                WHERE template_id = ANY(:ids) ORDER BY category, item_name
+            """), {"ids": ids}).fetchall()
+            for it in items:
+                items_by_template.setdefault(it.template_id, []).append(it)
+    return templates, items_by_template
+
+
+@st.cache_data(ttl=300)
+def get_community_gear_templates(uid):
+    with engine.connect() as conn:
+        templates = conn.execute(text("""
+            SELECT gt.id, gt.template_name, u.firstname, u.lastname, COUNT(gti.id) AS item_count
+            FROM gear_templates gt
+            JOIN users u ON gt.user_id=u.id
+            LEFT JOIN gear_template_items gti ON gt.id=gti.template_id
+            WHERE gt.is_public=TRUE AND gt.user_id!=:uid
+            GROUP BY gt.id, gt.template_name, u.firstname, u.lastname
+            ORDER BY item_count DESC LIMIT 20
+        """), {"uid": uid}).fetchall()
+        ids = [t.id for t in templates]
+        items_by_template = {}
+        if ids:
+            items = conn.execute(text("""
+                SELECT template_id, category, item_name FROM gear_template_items
+                WHERE template_id = ANY(:ids) ORDER BY category, item_name
+            """), {"ids": ids}).fetchall()
+            for it in items:
+                items_by_template.setdefault(it.template_id, []).append(it)
+    return templates, items_by_template
+
 
 # ─────────────────────────────────────────────
 # HELPERS
@@ -112,6 +542,7 @@ def trip_status(start_d, end_d):
         return ("🟢", "Happening Now!", "green")
     return ("✅", "Completed", "gray")
 
+
 def create_pdf(itinerary_text, park_name, user_name):
     pdf = FPDF()
     pdf.add_page()
@@ -125,33 +556,10 @@ def create_pdf(itinerary_text, park_name, user_name):
     pdf.multi_cell(0, 7, clean_text.encode('latin-1', 'ignore').decode('latin-1'))
     return bytes(pdf.output())
 
-def get_pending_trip_invites(conn, uid):
-    return conn.execute(text("""
-        SELECT tp.id AS participant_id, t.id AS trip_id, t.trip_name,
-               t.start_date, t.end_date,
-               u_owner.firstname || ' ' || u_owner.lastname AS invited_by_name,
-               STRING_AGG(p.name, ', ' ORDER BY p.name) AS park_names
-        FROM trip_participants tp
-        JOIN trips t ON tp.trip_id = t.id
-        JOIN users u_owner ON t.owner_id = u_owner.id
-        LEFT JOIN trip_parks tpk ON t.id = tpk.trip_id
-        LEFT JOIN parks p ON tpk.park_id = p.id
-        WHERE tp.user_id = :uid AND tp.invitation_status = 'pending' AND tp.role != 'owner'
-        GROUP BY tp.id, t.id, t.trip_name, t.start_date, t.end_date, u_owner.firstname, u_owner.lastname
-    """), {"uid": uid}).fetchall()
-
-def get_pending_count(uid):
-    with engine.connect() as conn:
-        result = conn.execute(text("""
-            SELECT
-                (SELECT COUNT(*) FROM friendships WHERE friend_id=:uid AND status='pending') +
-                (SELECT COUNT(*) FROM trip_participants WHERE user_id=:uid AND invitation_status='pending' AND role!='owner')
-            AS total
-        """), {"uid": uid}).scalar()
-    return result or 0
 
 def can_edit(role):
     return role in ('owner', 'collaborator')
+
 
 def date_range_days(start, end):
     if not start or not end:
@@ -166,15 +574,6 @@ def date_range_days(start, end):
         day += 1
     return days
 
-def get_trip_parks(conn, trip_id):
-    return conn.execute(text("""
-        SELECT tpk.id AS trip_park_id, tpk.park_id, p.name AS park_name,
-               p.image_url, tpk.notes
-        FROM trip_parks tpk
-        JOIN parks p ON tpk.park_id = p.id
-        WHERE tpk.trip_id = :tid
-        ORDER BY p.name
-    """), {"tid": trip_id}).fetchall()
 
 def parse_activity_day_defaults(master_itinerary, num_days):
     day_map = {}
@@ -192,21 +591,20 @@ def parse_activity_day_defaults(master_itinerary, num_days):
             day_map[line_stripped.lower()] = current_day
     return day_map
 
+
 def guess_day_for_activity(activity_name, day_map, default_day=1):
     name_lower = activity_name.lower()
     for line_text, day_num in day_map.items():
         if name_lower in line_text or line_text in name_lower:
             return day_num
     name_words = set(name_lower.split())
-    best_overlap = 0
-    best_day = default_day
+    best_overlap, best_day = 0, default_day
     for line_text, day_num in day_map.items():
-        line_words = set(line_text.split())
-        overlap = len(name_words & line_words)
+        overlap = len(name_words & set(line_text.split()))
         if overlap > best_overlap and overlap >= 2:
-            best_overlap = overlap
-            best_day = day_num
+            best_overlap, best_day = overlap, day_num
     return best_day
+
 
 # ─────────────────────────────────────────────
 # CONFLICT DETECTION
@@ -216,7 +614,7 @@ STRENUOUS_KEYWORDS = {"hike", "hiking", "climb", "climbing", "backpack", "backpa
                       "trail", "summit", "scramble", "trek", "trekking", "rafting", "kayak"}
 NIGHT_KEYWORDS = {"stargazing", "night", "sunset", "campfire", "evening", "dusk", "bonfire"}
 EARLY_KEYWORDS = {"sunrise", "dawn", "morning", "early", "ranger walk"}
-WATER_KEYWORDS = {"swim", "swimming", "snorkel", "diving", "kayak", "rafting", "canoe"}
+
 
 def classify_activity(name, atype):
     text_lower = (name + " " + atype).lower()
@@ -227,9 +625,8 @@ def classify_activity(name, atype):
         tags.add("night")
     if any(k in text_lower for k in EARLY_KEYWORDS):
         tags.add("early")
-    if any(k in text_lower for k in WATER_KEYWORDS):
-        tags.add("water")
     return tags
+
 
 def compute_conflict_warnings(day_activities):
     warnings = {}
@@ -239,27 +636,25 @@ def compute_conflict_warnings(day_activities):
         night_acts = [a for a in acts if "night" in classify_activity(a["name"], a.get("type", ""))]
         early_acts = [a for a in acts if "early" in classify_activity(a["name"], a.get("type", ""))]
         if len(strenuous) >= 3:
-            names = ", ".join(a["name"] for a in strenuous)
-            day_warnings.append(f"🥵 **Heavy day!** 3+ strenuous activities: {names}")
+            day_warnings.append(f"🥵 **Heavy day!** 3+ strenuous activities: {', '.join(a['name'] for a in strenuous)}")
         elif len(strenuous) == 2:
-            names = " & ".join(a["name"] for a in strenuous)
-            day_warnings.append(f"⚠️ **Back-to-back effort:** {names} — consider spacing these out")
+            day_warnings.append(f"⚠️ **Back-to-back effort:** {' & '.join(a['name'] for a in strenuous)} — consider spacing these out")
         if night_acts and early_acts:
-            n = night_acts[0]["name"]
-            e = early_acts[0]["name"]
-            day_warnings.append(f"😴 **Sleep conflict:** '{e}' (early start) and '{n}' (late night) on the same day")
+            day_warnings.append(f"😴 **Sleep conflict:** '{early_acts[0]['name']}' (early start) and '{night_acts[0]['name']}' (late night) on the same day")
         if day_warnings:
             warnings[day_num] = day_warnings
     return warnings
 
+
 # ─────────────────────────────────────────────
-# AI HELPERS
+# AI HELPERS (Gemini) — unchanged behavior, still synchronous/blocking,
+# but only ever called from inside an explicit button click.
 # ─────────────────────────────────────────────
 
 def fetch_park_distances(park_names):
     if len(park_names) < 2:
         return []
-    pairs = [(park_names[i], park_names[i+1]) for i in range(len(park_names)-1)]
+    pairs = [(park_names[i], park_names[i + 1]) for i in range(len(park_names) - 1)]
     pair_text = "\n".join(f"- {a} to {b}" for a, b in pairs)
     prompt = f"""For each pair of US National Parks below, provide the approximate driving distance and time.
 Respond ONLY as a JSON array, no markdown, no extra text. Each element:
@@ -270,6 +665,7 @@ Pairs:\n{pair_text}"""
         return json.loads(re.sub(r"```json|```", "", resp).strip())
     except Exception:
         return []
+
 
 def generate_packing_list(park_names, activity_types, num_days):
     parks_str = ", ".join(park_names)
@@ -284,6 +680,7 @@ Include 25-35 items across: Clothing, Footwear, Navigation, Safety, Camping/Shel
         return json.loads(re.sub(r"```json|```", "", resp).strip())
     except Exception:
         return []
+
 
 def generate_trip_recap(trip_name, park_names, activities, notes, start_date, end_date):
     parks_str = ", ".join(park_names)
@@ -305,8 +702,10 @@ Write 3-4 paragraphs in a warm, storytelling style — like a travel journal ent
     except Exception:
         return ""
 
+
 # ─────────────────────────────────────────────
-# STATS / BADGES
+# BADGES  (single round-trip instead of 7; only computed once per session
+# or when mark_badges_dirty() is called after a badge-relevant action)
 # ─────────────────────────────────────────────
 
 BADGE_DEFINITIONS = [
@@ -322,69 +721,58 @@ BADGE_DEFINITIONS = [
     ("all_packer",   "🎒 Overpacker",       "Checked off a full packing list"),
 ]
 
+
+def mark_badges_dirty():
+    st.session_state["badges_checked_session"] = False
+
+
 def compute_and_award_badges(uid):
-    """Runs ~7 queries. Only call this when something badge-relevant happened —
-    not on every rerun (see mark_badges_dirty / badges_checked_session)."""
     with engine.connect() as conn:
-        trip_count = conn.execute(text("""
-            SELECT COUNT(*) FROM trips t JOIN trip_participants tp ON t.id=tp.trip_id
-            WHERE tp.user_id=:uid AND tp.invitation_status='accepted' AND tp.role='owner'
-        """), {"uid": uid}).scalar() or 0
-        park_count = conn.execute(text("""
-            SELECT COUNT(DISTINCT tpk.park_id) FROM trip_parks tpk
-            JOIN trips t ON tpk.trip_id=t.id JOIN trip_participants tp ON t.id=tp.trip_id
-            WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
-        """), {"uid": uid}).scalar() or 0
-        state_count = conn.execute(text("""
-            SELECT COUNT(DISTINCT p.state) FROM trip_parks tpk
-            JOIN trips t ON tpk.trip_id=t.id JOIN trip_participants tp ON t.id=tp.trip_id
-            JOIN parks p ON tpk.park_id=p.id
-            WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
-        """), {"uid": uid}).scalar() or 0
-        friend_count = conn.execute(text("""
-            SELECT COUNT(*) FROM friendships WHERE (user_id=:uid OR friend_id=:uid) AND status='accepted'
-        """), {"uid": uid}).scalar() or 0
-        group_trip = conn.execute(text("""
-            SELECT COUNT(*) FROM trips t JOIN trip_participants tp ON t.id=tp.trip_id
-            WHERE t.owner_id=:uid AND (
-                SELECT COUNT(*) FROM trip_participants WHERE trip_id=t.id AND invitation_status='accepted') > 1
-        """), {"uid": uid}).scalar() or 0
-        note_count = conn.execute(text("""
-            SELECT COUNT(*) FROM trip_day_notes WHERE author_id=:uid
-        """), {"uid": uid}).scalar() or 0
-        full_packing = conn.execute(text("""
-            SELECT COUNT(*) FROM trip_packing_items tpi JOIN trips t ON tpi.trip_id=t.id
-            JOIN trip_participants tp ON t.id=tp.trip_id
-            WHERE tp.user_id=:uid AND tp.role='owner'
-              AND t.id IN (
-                SELECT trip_id FROM trip_packing_items GROUP BY trip_id
-                HAVING COUNT(*)>0 AND COUNT(*)=SUM(CASE WHEN is_checked THEN 1 ELSE 0 END))
-        """), {"uid": uid}).scalar() or 0
+        row = conn.execute(text("""
+            SELECT
+              (SELECT COUNT(*) FROM trips t JOIN trip_participants tp ON t.id=tp.trip_id
+                 WHERE tp.user_id=:uid AND tp.invitation_status='accepted' AND tp.role='owner') AS trip_count,
+              (SELECT COUNT(DISTINCT tpk.park_id) FROM trip_parks tpk
+                 JOIN trips t ON tpk.trip_id=t.id JOIN trip_participants tp ON t.id=tp.trip_id
+                 WHERE tp.user_id=:uid AND tp.invitation_status='accepted') AS park_count,
+              (SELECT COUNT(DISTINCT p.state) FROM trip_parks tpk
+                 JOIN trips t ON tpk.trip_id=t.id JOIN trip_participants tp ON t.id=tp.trip_id
+                 JOIN parks p ON tpk.park_id=p.id
+                 WHERE tp.user_id=:uid AND tp.invitation_status='accepted') AS state_count,
+              (SELECT COUNT(*) FROM friendships WHERE (user_id=:uid OR friend_id=:uid) AND status='accepted') AS friend_count,
+              (SELECT COUNT(*) FROM trips t WHERE t.owner_id=:uid AND (
+                 SELECT COUNT(*) FROM trip_participants WHERE trip_id=t.id AND invitation_status='accepted') > 1) AS group_trip,
+              (SELECT COUNT(*) FROM trip_day_notes WHERE author_id=:uid) AS note_count,
+              (SELECT COUNT(*) FROM trip_packing_items tpi JOIN trips t ON tpi.trip_id=t.id
+                 JOIN trip_participants tp ON t.id=tp.trip_id
+                 WHERE tp.user_id=:uid AND tp.role='owner' AND t.id IN (
+                   SELECT trip_id FROM trip_packing_items GROUP BY trip_id
+                   HAVING COUNT(*)>0 AND COUNT(*)=SUM(CASE WHEN is_checked THEN 1 ELSE 0 END))) AS full_packing
+        """), {"uid": uid}).mappings().fetchone()
+
+        existing = {r[0] for r in conn.execute(
+            text("SELECT badge_key FROM user_badges WHERE user_id=:uid"), {"uid": uid}).fetchall()}
 
     conditions = {
-        "first_trip": trip_count>=1, "5_trips": trip_count>=5, "10_trips": trip_count>=10,
-        "3_parks": park_count>=3, "10_parks": park_count>=10, "5_states": state_count>=5,
-        "first_friend": friend_count>=1, "group_trip": group_trip>=1,
-        "note_taker": note_count>=10, "all_packer": full_packing>=1,
+        "first_trip": row["trip_count"] >= 1, "5_trips": row["trip_count"] >= 5, "10_trips": row["trip_count"] >= 10,
+        "3_parks": row["park_count"] >= 3, "10_parks": row["park_count"] >= 10, "5_states": row["state_count"] >= 5,
+        "first_friend": row["friend_count"] >= 1, "group_trip": row["group_trip"] >= 1,
+        "note_taker": row["note_count"] >= 10, "all_packer": row["full_packing"] >= 1,
     }
     newly_earned = []
     badge_map = {b[0]: b for b in BADGE_DEFINITIONS}
-    with engine.connect() as conn:
-        existing = {r[0] for r in conn.execute(
-            text("SELECT badge_key FROM user_badges WHERE user_id=:uid"), {"uid": uid}).fetchall()}
-    for key, earned in conditions.items():
-        if earned and key not in existing:
-            bdef = badge_map[key]
-            try:
-                with engine.begin() as conn:
-                    conn.execute(text("""
-                        INSERT INTO user_badges (user_id, badge_key, badge_name, badge_description)
-                        VALUES (:uid,:key,:name,:desc) ON CONFLICT (user_id,badge_key) DO NOTHING
-                    """), {"uid": uid, "key": key, "name": bdef[1], "desc": bdef[2]})
+    to_insert = [(k, badge_map[k]) for k, earned in conditions.items() if earned and k not in existing]
+    if to_insert:
+        with engine.begin() as conn:
+            for key, bdef in to_insert:
+                conn.execute(text("""
+                    INSERT INTO user_badges (user_id, badge_key, badge_name, badge_description)
+                    VALUES (:uid,:key,:name,:desc) ON CONFLICT (user_id,badge_key) DO NOTHING
+                """), {"uid": uid, "key": key, "name": bdef[1], "desc": bdef[2]})
                 newly_earned.append(bdef[1])
-            except Exception:
-                pass
+        get_stats.clear()
     return newly_earned
+
 
 # ─────────────────────────────────────────────
 # DRAG-AND-DROP ITINERARY COMPONENT
@@ -396,40 +784,33 @@ def render_dnd_itinerary(day_activities, days, editable=True, conflict_warnings=
     days_data = []
     for day_num, day_date in days:
         acts = day_activities.get(day_num, [])
-        cw = conflict_warnings.get(day_num, [])
         days_data.append({
             "day": day_num,
             "label": f"Day {day_num} — {day_date.strftime('%a, %b %d')}",
             "activities": [{"id": a["id"], "name": a["name"], "type": a.get("type", "Activity")} for a in acts],
-            "warnings": cw,
+            "warnings": conflict_warnings.get(day_num, []),
         })
 
     delete_btn = '<button class="delete-btn" onclick="deleteActivity(this)" title="Remove">✕</button>' if editable else ""
     draggable_attr = "draggable='true' ondragstart='handleDragStart(event, this)'" if editable else ""
     cursor_style = "cursor: grab;" if editable else ""
 
-    def warning_html(warnings):
-        if not warnings:
-            return ""
-        items = "".join(f'<div class="warn-item">{w}</div>' for w in warnings)
-        return f'<div class="day-warnings">{items}</div>'
-
     def build_day_html(d):
-        warn = warning_html(d["warnings"])
+        warn = "".join(f'<div class="warn-item">{w}</div>' for w in d["warnings"])
+        warn_html = f'<div class="day-warnings">{warn}</div>' if warn else ""
         has_warn_class = " has-warning" if d["warnings"] else ""
-        acts_html = ""
-        for a in d["activities"]:
-            acts_html += (
-                f'''<div class="activity-card" {draggable_attr} data-id="{a["id"]}" data-day="{d["day"]}">'''
-                f'''<div><div class="act-name">{a["name"]}</div><div class="act-type">{a["type"]}</div></div>'''
-                f'''{delete_btn}</div>'''
-            )
+        acts_html = "".join(
+            f'''<div class="activity-card" {draggable_attr} data-id="{a["id"]}" data-day="{d["day"]}">'''
+            f'''<div><div class="act-name">{a["name"]}</div><div class="act-type">{a["type"]}</div></div>'''
+            f'''{delete_btn}</div>'''
+            for a in d["activities"]
+        )
         return (
             f'''<div class="day-col{has_warn_class}" id="day-{d["day"]}" '''
-            f'''ondragover="event.preventDefault(); this.querySelector(\'.drop-zone\').classList.add(\'drag-over\')" '''
-            f'''ondragleave="this.querySelector(\'.drop-zone\').classList.remove(\'drag-over\')" '''
+            f'''ondragover="event.preventDefault(); this.querySelector('.drop-zone').classList.add('drag-over')" '''
+            f'''ondragleave="this.querySelector('.drop-zone').classList.remove('drag-over')" '''
             f'''ondrop="handleDrop(event, {d["day"]})">'''
-            f'''<div class="day-header">{d["label"]}</div>{warn}{acts_html}<div class="drop-zone"></div></div>'''
+            f'''<div class="day-header">{d["label"]}</div>{warn_html}{acts_html}<div class="drop-zone"></div></div>'''
         )
 
     days_html = "".join(build_day_html(d) for d in days_data)
@@ -438,11 +819,7 @@ def render_dnd_itinerary(day_activities, days, editable=True, conflict_warnings=
     <style>
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{ font-family: 'Segoe UI', sans-serif; background: transparent; }}
-        .itinerary-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-            gap: 12px; padding: 4px;
-        }}
+        .itinerary-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; padding: 4px; }}
         .day-col {{ background: #f0f4f8; border-radius: 10px; padding: 10px; min-height: 120px; }}
         .day-col.has-warning {{ background: #fff8e1; border: 1px solid #ffe082; }}
         .day-header {{ font-size: 0.8em; font-weight: 700; color: #2d6a4f; margin-bottom: 8px;
@@ -502,97 +879,16 @@ def render_dnd_itinerary(day_activities, days, editable=True, conflict_warnings=
         }}
     </script>
     """
-    result = st.components.v1.html(html, height=max(300, len(days) * 60 + 100), scrolling=False)
-    return result
+    return st.components.v1.html(html, height=max(300, len(days) * 60 + 100), scrolling=False)
 
-# ─────────────────────────────────────────────
-# LAZY TRIP-DETAIL LOADER  (the big perf fix for My Trips)
-# ─────────────────────────────────────────────
-# Previously, every one of these ~9 queries ran for every trip on every
-# single rerun anywhere in the app. Now we fetch once, cache the result in
-# session_state, and only re-fetch when this trip's own data actually
-# changes (note added, expense added, etc.) via invalidate_trip_data().
-
-def load_trip_heavy_data(tid, start_d):
-    with engine.connect() as conn:
-        saved_acts = conn.execute(text("""
-            SELECT id, day_number, activity_name, activity_type, sort_order
-            FROM trip_activities WHERE trip_id=:tid ORDER BY day_number, sort_order
-        """), {"tid": tid}).fetchall()
-
-        all_notes_rows = conn.execute(text("""
-            SELECT tdn.id, tdn.day_number, tdn.note_text, tdn.created_at,
-                   u.firstname, u.lastname, tdn.author_id
-            FROM trip_day_notes tdn JOIN users u ON tdn.author_id=u.id
-            WHERE tdn.trip_id=:tid ORDER BY tdn.day_number, tdn.created_at
-        """), {"tid": tid}).fetchall()
-
-        trip_parks_rows = get_trip_parks(conn, tid)
-        park_ids = [tp.park_id for tp in trip_parks_rows]
-
-        trip_alerts, crowd_rows, warn_rows = [], [], []
-        if park_ids:
-            trip_alerts = conn.execute(text("""
-                SELECT a.title, a.category, a.description, p.name AS park_name
-                FROM alerts a JOIN parks p ON a.park_id=p.id
-                WHERE a.park_id=ANY(:pids) AND a.isactive=TRUE
-                ORDER BY p.name, a.category
-            """), {"pids": park_ids}).fetchall()
-
-            trip_month = start_d.month if start_d else None
-            if trip_month:
-                crowd_rows = conn.execute(text("""
-                    SELECT p.name AS park_name, pcc.crowd_level, pcc.notes
-                    FROM park_crowd_calendar pcc JOIN parks p ON pcc.park_id=p.id
-                    WHERE pcc.park_id=ANY(:pids) AND pcc.month=:m ORDER BY p.name
-                """), {"pids": park_ids, "m": trip_month}).fetchall()
-                warn_rows = conn.execute(text("""
-                    SELECT p.name AS park_name, psw.warning_type, psw.description
-                    FROM park_seasonal_warnings psw JOIN parks p ON psw.park_id=p.id
-                    WHERE psw.park_id=ANY(:pids)
-                      AND ((psw.month_start <= psw.month_end AND :m BETWEEN psw.month_start AND psw.month_end)
-                           OR (psw.month_start > psw.month_end AND (:m >= psw.month_start OR :m <= psw.month_end)))
-                    ORDER BY p.name
-                """), {"pids": park_ids, "m": trip_month}).fetchall()
-
-        packing_rows = conn.execute(text("""
-            SELECT id, category, item_name, is_checked FROM trip_packing_items
-            WHERE trip_id=:tid ORDER BY category, item_name
-        """), {"tid": tid}).fetchall()
-
-        expenses = conn.execute(text("""
-            SELECT te.id, te.day_number, te.category, te.description, te.amount, u.firstname AS paid_by_name
-            FROM trip_expenses te LEFT JOIN users u ON te.paid_by=u.id
-            WHERE te.trip_id=:tid ORDER BY te.day_number, te.created_at
-        """), {"tid": tid}).fetchall()
-
-        permits = conn.execute(text("""
-            SELECT tp2.id, tp2.permit_name, p.name AS park_name, tp2.required_by, tp2.secured, tp2.notes
-            FROM trip_permits tp2 LEFT JOIN parks p ON tp2.park_id=p.id
-            WHERE tp2.trip_id=:tid ORDER BY tp2.required_by NULLS LAST
-        """), {"tid": tid}).fetchall()
-
-        participants = conn.execute(text("""
-            SELECT u.firstname, u.lastname, u.username, tp.role, tp.invitation_status
-            FROM trip_participants tp JOIN users u ON tp.user_id=u.id
-            WHERE tp.trip_id=:tid ORDER BY tp.role
-        """), {"tid": tid}).fetchall()
-
-    return {
-        "acts": saved_acts, "notes": all_notes_rows, "trip_parks": trip_parks_rows,
-        "alerts": trip_alerts, "crowd": crowd_rows, "warnings": warn_rows,
-        "packing": packing_rows, "expenses": expenses, "permits": permits,
-        "participants": participants,
-    }
 
 def get_trip_data(tid, start_d):
-    key = f"trip_data_{tid}"
-    if key not in st.session_state:
-        st.session_state[key] = load_trip_heavy_data(tid, start_d)
-    return st.session_state[key]
+    return load_trip_heavy_data(tid, start_d)
+
 
 def invalidate_trip_data(tid):
-    st.session_state.pop(f"trip_data_{tid}", None)
+    load_trip_heavy_data.clear()
+
 
 # ─────────────────────────────────────────────
 # PASSWORD HELPERS
@@ -601,11 +897,13 @@ def invalidate_trip_data(tid):
 def hash_password(plain: str) -> str:
     return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
 
+
 def check_password(plain: str, hashed: str) -> bool:
     try:
         return bcrypt.checkpw(plain.encode(), hashed.encode())
     except Exception:
         return False
+
 
 def validate_password(pw: str) -> str | None:
     if len(pw) < 8:
@@ -616,22 +914,23 @@ def validate_password(pw: str) -> str | None:
         return "Password must contain at least one number."
     return None
 
+
 def dob_to_password(dob: date) -> str:
     return dob.strftime("%m%d%Y")
+
 
 def is_dob_password(plain: str, dob: date) -> bool:
     return plain == dob_to_password(dob)
 
-# ─────────────────────────────────────────────
-# AUTH
-# ─────────────────────────────────────────────
 
-if not st.session_state.logged_in:
+# ═════════════════════════════════════════════════════════════════════════
+# AUTH  (runs only pre-login; not part of the rerun-cost problem, left as-is)
+# ═════════════════════════════════════════════════════════════════════════
+
+def render_auth():
     st.title("🌲 National Park Planner 🐻")
-
     screen = st.session_state.auth_screen
 
-    # ── FORCE PASSWORD CHANGE ────────────────────────────────────────────
     if screen in ("set_password", "force_change"):
         if screen == "set_password":
             st.subheader("🔒 Set your password")
@@ -652,15 +951,12 @@ if not st.session_state.logged_in:
                 st.error("Passwords don't match.")
             else:
                 with engine.begin() as conn:
-                    conn.execute(
-                        text("UPDATE users SET password_hash=:ph WHERE id=:uid"),
-                        {"ph": hash_password(pw1), "uid": st.session_state.pending_uid}
-                    )
+                    conn.execute(text("UPDATE users SET password_hash=:ph WHERE id=:uid"),
+                                 {"ph": hash_password(pw1), "uid": st.session_state.pending_uid})
                 with engine.connect() as conn:
-                    res = conn.execute(
-                        text("SELECT id, username, firstname, lastname, email, likes, date_of_birth FROM users WHERE id=:uid"),
-                        {"uid": st.session_state.pending_uid}
-                    ).mappings().fetchone()
+                    res = conn.execute(text(
+                        "SELECT id, username, firstname, lastname, email, likes, date_of_birth FROM users WHERE id=:uid"
+                    ), {"uid": st.session_state.pending_uid}).mappings().fetchone()
                 st.session_state.user_info = {k: v for k, v in res.items() if k != "date_of_birth"}
                 st.session_state.logged_in = True
                 st.session_state.auth_screen = "login"
@@ -671,7 +967,6 @@ if not st.session_state.logged_in:
             st.session_state.pending_uid = None
             st.rerun()
 
-    # ── RESET PASSWORD (DOB lookup) ──────────────────────────────────────
     elif screen == "reset":
         st.subheader("🔑 Reset your password")
         st.caption("Enter your username and date of birth. Your password will be reset to your DOB (MMDDYYYY) and you'll be prompted to change it on login.")
@@ -685,10 +980,7 @@ if not st.session_state.logged_in:
                 st.error("Please fill in both fields.")
             else:
                 with engine.connect() as conn:
-                    row = conn.execute(
-                        text("SELECT id, date_of_birth FROM users WHERE username=:u"),
-                        {"u": reset_u}
-                    ).fetchone()
+                    row = conn.execute(text("SELECT id, date_of_birth FROM users WHERE username=:u"), {"u": reset_u}).fetchone()
                 if not row or not row.date_of_birth:
                     st.error("No account found with that username and date of birth.")
                 else:
@@ -698,10 +990,7 @@ if not st.session_state.logged_in:
                     else:
                         dob_pw = dob_to_password(stored_dob)
                         with engine.begin() as conn:
-                            conn.execute(
-                                text("UPDATE users SET password_hash=:ph WHERE id=:uid"),
-                                {"ph": hash_password(dob_pw), "uid": row.id}
-                            )
+                            conn.execute(text("UPDATE users SET password_hash=:ph WHERE id=:uid"), {"ph": hash_password(dob_pw), "uid": row.id})
                         st.success(f"Password reset! Log in with your username and **{dob_pw}** — you'll be prompted to set a new password.")
                         st.session_state.auth_screen = "login"
                         st.rerun()
@@ -709,7 +998,6 @@ if not st.session_state.logged_in:
             st.session_state.auth_screen = "login"
             st.rerun()
 
-    # ── SIGN UP ───────────────────────────────────────────────────────────
     elif screen == "signup":
         st.subheader("🌲 Create Account")
         with st.form("signup_form"):
@@ -738,10 +1026,10 @@ if not st.session_state.logged_in:
                 else:
                     try:
                         with engine.begin() as conn:
-                            conn.execute(
-                                text("INSERT INTO users (username, firstname, lastname, email, likes, password_hash, date_of_birth) VALUES (:u,:f,:ln,:e,:l,:ph,:dob)"),
-                                {"u": nu, "f": fn, "ln": ln, "e": em, "l": lk, "ph": hash_password(pw1), "dob": dob}
-                            )
+                            conn.execute(text(
+                                "INSERT INTO users (username, firstname, lastname, email, likes, password_hash, date_of_birth) "
+                                "VALUES (:u,:f,:ln,:e,:l,:ph,:dob)"
+                            ), {"u": nu, "f": fn, "ln": ln, "e": em, "l": lk, "ph": hash_password(pw1), "dob": dob})
                         st.success("Account created! You can now log in.")
                         st.session_state.auth_screen = "login"
                         st.rerun()
@@ -754,7 +1042,6 @@ if not st.session_state.logged_in:
             st.session_state.auth_screen = "login"
             st.rerun()
 
-    # ── LOGIN ─────────────────────────────────────────────────────────────
     else:
         st.subheader("Welcome back")
         with st.form("login_form"):
@@ -764,10 +1051,10 @@ if not st.session_state.logged_in:
         if submitted:
             u = u.strip().lower()
             with engine.connect() as conn:
-                res = conn.execute(
-                    text("SELECT id, username, firstname, lastname, email, likes, password_hash, date_of_birth FROM users WHERE username=:u"),
-                    {"u": u}
-                ).mappings().fetchone()
+                res = conn.execute(text(
+                    "SELECT id, username, firstname, lastname, email, likes, password_hash, date_of_birth "
+                    "FROM users WHERE username=:u"
+                ), {"u": u}).mappings().fetchone()
 
             if not res:
                 st.error("Invalid username or password.")
@@ -802,21 +1089,12 @@ if not st.session_state.logged_in:
             st.session_state.auth_screen = "reset"
             st.rerun()
 
-# ─────────────────────────────────────────────
-# MAIN APP
-# ─────────────────────────────────────────────
 
-else:
-    current_uid = st.session_state.user_info['id']
+# ═════════════════════════════════════════════════════════════════════════
+# SECTION RENDERERS — each is only ever called for the ONE active section.
+# ═════════════════════════════════════════════════════════════════════════
 
-    # Badge check: only runs once per session (or after mark_badges_dirty()
-    # is called by an action that could earn one), instead of on every rerun.
-    if not st.session_state.badges_checked_session:
-        new_badges = compute_and_award_badges(current_uid)
-        st.session_state.badges_checked_session = True
-        for b in new_badges:
-            st.toast(f"🏅 Badge unlocked: {b}!", icon="🎉")
-
+def render_sidebar(current_uid):
     with st.sidebar:
         st.write(f"Welcome back, **{st.session_state.user_info['firstname']}**")
         pending_count = get_pending_count(current_uid)
@@ -843,7 +1121,7 @@ else:
                 new_likes = st.text_area("Travel Style / Interests", value=st.session_state.user_info.get("likes", ""), height=100)
                 st.caption(f"🎂 Date of Birth: **{dob_display}** _(used for password reset)_")
                 new_dob = st.date_input("Update Date of Birth", value=current_dob,
-                                        min_value=date(1900, 1, 1), max_value=date.today(), format="MM/DD/YYYY")
+                                         min_value=date(1900, 1, 1), max_value=date.today(), format="MM/DD/YYYY")
                 save_profile = st.form_submit_button("💾 Save Profile", use_container_width=True)
             if save_profile:
                 try:
@@ -866,8 +1144,7 @@ else:
                 update_pw = st.form_submit_button("Update Password", use_container_width=True)
             if update_pw:
                 with engine.connect() as conn:
-                    row = conn.execute(text("SELECT password_hash FROM users WHERE id=:uid"),
-                                       {"uid": current_uid}).fetchone()
+                    row = conn.execute(text("SELECT password_hash FROM users WHERE id=:uid"), {"uid": current_uid}).fetchone()
                 if not row or not row.password_hash:
                     st.error("No password set on this account.")
                 elif not check_password(cp_current, row.password_hash):
@@ -880,8 +1157,7 @@ else:
                         st.error("New passwords don't match.")
                     else:
                         with engine.begin() as conn:
-                            conn.execute(text("UPDATE users SET password_hash=:ph WHERE id=:uid"),
-                                         {"ph": hash_password(cp_new1), "uid": current_uid})
+                            conn.execute(text("UPDATE users SET password_hash=:ph WHERE id=:uid"), {"ph": hash_password(cp_new1), "uid": current_uid})
                         st.success("Password updated!")
 
         st.divider()
@@ -891,453 +1167,349 @@ else:
             st.session_state.auth_screen = "login"
             st.rerun()
 
-    plan_tab, explorer_tab, friend_tab, my_trips_tab, stats_tab, passport_tab, discover_tab, gear_tab, notif_tab = st.tabs([
-        "🗺️ Plan Trip", "🔭 Park Explorer", "👥 Friends", "🎒 My Trips", "📊 My Stats",
-        "🗺 Passport", "🌍 Discover", "🎒 Gear", "🔔 Notifications"
-    ])
 
-    # ─────────────────────────────────────────────
-    # NOTIFICATIONS TAB
-    # ─────────────────────────────────────────────
-    with notif_tab:
-        st.header("🔔 Notifications")
+def render_notifications(current_uid):
+    st.header("🔔 Notifications")
+    data = get_notifications_data(current_uid)
+    friend_reqs, trip_invites, recent_notes = data["friend_reqs"], data["trip_invites"], data["recent_notes"]
 
-        with engine.connect() as conn:
-            friend_reqs = conn.execute(text("""
-                SELECT f.id, u.firstname, u.lastname, u.username, f.status
-                FROM friendships f JOIN users u ON f.user_id=u.id
-                WHERE f.friend_id=:uid AND f.status='pending' ORDER BY f.id DESC
-            """), {"uid": current_uid}).fetchall()
-            trip_invites = get_pending_trip_invites(conn, current_uid)
-            recent_notes = conn.execute(text("""
-                SELECT tdn.id, tdn.trip_id, tdn.day_number, tdn.note_text, tdn.created_at,
-                       u.firstname, u.lastname, t.trip_name
-                FROM trip_day_notes tdn
-                JOIN users u ON tdn.author_id=u.id
-                JOIN trips t ON tdn.trip_id=t.id
-                JOIN trip_participants tp ON t.id=tp.trip_id
-                WHERE tp.user_id=:uid AND tdn.author_id!=:uid
-                  AND tdn.created_at > NOW() - INTERVAL '7 days'
-                ORDER BY tdn.created_at DESC LIMIT 20
-            """), {"uid": current_uid}).fetchall()
+    if friend_reqs:
+        st.subheader("👤 Friend Requests")
+        for req in friend_reqs:
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([4, 1, 1])
+                c1.write(f"**{req.firstname} {req.lastname}** (@{req.username}) wants to connect")
+                if c2.button("✅ Accept", key=f"notif_acc_friend_{req.id}"):
+                    with engine.begin() as conn:
+                        conn.execute(text("UPDATE friendships SET status='accepted' WHERE id=:rid"), {"rid": req.id})
+                    get_notifications_data.clear(); get_friends.clear(); get_pending_count.clear()
+                    mark_badges_dirty()
+                    st.rerun()
+                if c3.button("❌ Decline", key=f"notif_dec_friend_{req.id}"):
+                    with engine.begin() as conn:
+                        conn.execute(text("DELETE FROM friendships WHERE id=:rid"), {"rid": req.id})
+                    get_notifications_data.clear(); get_pending_count.clear()
+                    st.rerun()
+        st.divider()
 
-        if friend_reqs:
-            st.subheader("👤 Friend Requests")
-            for req in friend_reqs:
+    if trip_invites:
+        st.subheader("🎒 Trip Invites")
+        for inv in trip_invites:
+            with st.container(border=True):
+                st.write(f"**{inv.trip_name}**")
+                st.caption(f"📍 {inv.park_names or 'Multiple Parks'}  •  📅 {inv.start_date} → {inv.end_date}  •  From **{inv.invited_by_name}**")
+                col1, col2 = st.columns(2)
+                if col1.button("Accept 🎒", key=f"notif_acc_trip_{inv.participant_id}"):
+                    with engine.begin() as conn:
+                        conn.execute(text("UPDATE trip_participants SET invitation_status='accepted', responded_at=CURRENT_TIMESTAMP WHERE id=:pid"), {"pid": inv.participant_id})
+                    st.success(f"You're going to **{inv.trip_name}**! 🎉")
+                    get_notifications_data.clear(); get_pending_count.clear(); get_my_trips.clear()
+                    mark_badges_dirty()
+                    st.rerun()
+                if col2.button("Decline ❌", key=f"notif_dec_trip_{inv.participant_id}"):
+                    with engine.begin() as conn:
+                        conn.execute(text("UPDATE trip_participants SET invitation_status='declined', responded_at=CURRENT_TIMESTAMP WHERE id=:pid"), {"pid": inv.participant_id})
+                    get_notifications_data.clear(); get_pending_count.clear()
+                    st.rerun()
+        st.divider()
+
+    if recent_notes:
+        st.subheader("📝 Recent Journal Activity on Your Trips")
+        for note in recent_notes:
+            with st.container(border=True):
+                st.caption(f"**{note.firstname} {note.lastname}** wrote on **{note.trip_name}** — Day {note.day_number}")
+                st.markdown(f"> {note.note_text}")
+                ts = note.created_at.strftime('%b %d, %Y') if hasattr(note.created_at, 'strftime') else str(note.created_at)
+                st.caption(ts)
+    elif not friend_reqs and not trip_invites:
+        st.info("You're all caught up! No pending notifications.")
+
+
+def render_explorer(current_uid):
+    st.header("🔭 Park Explorer")
+    st.caption("Browse all national parks, discover details, and save parks to your wishlist.")
+
+    all_parks_df = get_parks_with_details()
+    alert_map = get_active_alerts_map()
+    wishlist_ids = get_wishlist_ids(current_uid)
+
+    all_parks_df = all_parks_df.copy()
+    all_parks_df['wishlisted'] = all_parks_df['id'].isin(wishlist_ids)
+
+    fc1, fc2, fc3 = st.columns([2, 2, 1])
+    search_q = fc1.text_input("🔍 Search parks", placeholder="e.g. Yellowstone, CA...")
+    states = sorted(all_parks_df['state'].dropna().unique().tolist())
+    state_filter = fc2.selectbox("Filter by State", ["All States"] + states)
+    wishlist_only = fc3.checkbox("❤️ Wishlist only")
+
+    filtered = all_parks_df
+    if search_q:
+        filtered = filtered[filtered['name'].str.contains(search_q, case=False, na=False) |
+                             filtered['state'].str.contains(search_q, case=False, na=False)]
+    if state_filter != "All States":
+        filtered = filtered[filtered['state'] == state_filter]
+    if wishlist_only:
+        filtered = filtered[filtered['wishlisted'] == True]
+
+    st.caption(f"Showing {len(filtered)} parks")
+
+    # Batched alert-detail lookup for every park with an active alert on screen —
+    # replaces the old one-query-per-expanded-card pattern.
+    visible_alert_ids = tuple(sorted(pid for pid in filtered['id'] if pid in alert_map))
+    alerts_detail = get_alerts_for_parks(visible_alert_ids)
+
+    for i in range(0, len(filtered), 3):
+        row_parks = filtered.iloc[i:i + 3]
+        cols = st.columns(3)
+        for col, (_, park) in zip(cols, row_parks.iterrows()):
+            with col:
                 with st.container(border=True):
-                    c1, c2, c3 = st.columns([4, 1, 1])
-                    c1.write(f"**{req.firstname} {req.lastname}** (@{req.username}) wants to connect")
-                    if c2.button("✅ Accept", key=f"notif_acc_friend_{req.id}"):
+                    if park.get('image_url'):
+                        st.image(park['image_url'], use_container_width=True)
+                    alert_badge = f" 🚨 {alert_map[park['id']]} alert(s)" if park['id'] in alert_map else ""
+                    wishlist_icon = "❤️" if park['wishlisted'] else "🤍"
+                    st.markdown(f"**{park['name']}**{alert_badge}")
+                    st.caption(f"📍 {park['state']}")
+                    if park.get('entrance_fee_cost'):
+                        st.caption(f"💵 Entrance: ${park['entrance_fee_cost']}")
+                    with st.expander("ℹ️ Details"):
+                        if park.get('description'):
+                            desc = str(park['description'])
+                            st.write(desc[:400] + ("..." if len(desc) > 400 else ""))
+                        if park.get('weather_info'):
+                            st.caption(f"🌤️ {str(park['weather_info'])[:200]}")
+                        if park.get('visitor_center_hours'):
+                            st.caption(f"🕐 {str(park['visitor_center_hours'])[:200]}")
+                        if park.get('activities'):
+                            try:
+                                acts = json.loads(park['activities'])
+                                st.caption("Activities: " + ", ".join(acts[:8]))
+                            except Exception:
+                                pass
+                        for a in alerts_detail.get(park['id'], [])[:3]:
+                            st.warning(f"**{a.category}:** {a.title}")
+                    if st.button(f"{wishlist_icon} {'Remove from' if park['wishlisted'] else 'Add to'} Wishlist",
+                                 key=f"wl_{park['id']}", use_container_width=True):
                         with engine.begin() as conn:
-                            conn.execute(text("UPDATE friendships SET status='accepted' WHERE id=:rid"), {"rid": req.id})
-                        mark_badges_dirty()
-                        st.rerun()
-                    if c3.button("❌ Decline", key=f"notif_dec_friend_{req.id}"):
-                        with engine.begin() as conn:
-                            conn.execute(text("DELETE FROM friendships WHERE id=:rid"), {"rid": req.id})
-                        st.rerun()
-            st.divider()
-
-        if trip_invites:
-            st.subheader("🎒 Trip Invites")
-            for inv in trip_invites:
-                with st.container(border=True):
-                    st.write(f"**{inv.trip_name}**")
-                    st.caption(f"📍 {inv.park_names or 'Multiple Parks'}  •  📅 {inv.start_date} → {inv.end_date}  •  From **{inv.invited_by_name}**")
-                    col1, col2 = st.columns(2)
-                    if col1.button("Accept 🎒", key=f"notif_acc_trip_{inv.participant_id}"):
-                        with engine.begin() as conn:
-                            conn.execute(text("UPDATE trip_participants SET invitation_status='accepted', responded_at=CURRENT_TIMESTAMP WHERE id=:pid"), {"pid": inv.participant_id})
-                        st.success(f"You're going to **{inv.trip_name}**! 🎉")
-                        mark_badges_dirty()
-                        st.rerun()
-                    if col2.button("Decline ❌", key=f"notif_dec_trip_{inv.participant_id}"):
-                        with engine.begin() as conn:
-                            conn.execute(text("UPDATE trip_participants SET invitation_status='declined', responded_at=CURRENT_TIMESTAMP WHERE id=:pid"), {"pid": inv.participant_id})
-                        st.rerun()
-            st.divider()
-
-        if recent_notes:
-            st.subheader("📝 Recent Journal Activity on Your Trips")
-            for note in recent_notes:
-                with st.container(border=True):
-                    st.caption(f"**{note.firstname} {note.lastname}** wrote on **{note.trip_name}** — Day {note.day_number}")
-                    st.markdown(f"> {note.note_text}")
-                    ts = note.created_at.strftime('%b %d, %Y') if hasattr(note.created_at, 'strftime') else str(note.created_at)
-                    st.caption(ts)
-        elif not friend_reqs and not trip_invites:
-            st.info("You're all caught up! No pending notifications.")
-
-    # ─────────────────────────────────────────────
-    # PARK EXPLORER TAB
-    # ─────────────────────────────────────────────
-    with explorer_tab:
-        st.header("🔭 Park Explorer")
-        st.caption("Browse all national parks, discover details, and save parks to your wishlist.")
-
-        all_parks_df = get_parks_with_details()  # cached, ttl=600s
-        alert_map = get_active_alerts_map()      # cached, ttl=60s
-
-        with engine.connect() as conn:
-            wishlist_ids = {r[0] for r in conn.execute(
-                text("SELECT park_id FROM park_wishlists WHERE user_id=:uid"), {"uid": current_uid}).fetchall()}
-        all_parks_df = all_parks_df.copy()
-        all_parks_df['wishlisted'] = all_parks_df['id'].isin(wishlist_ids)
-
-        fc1, fc2, fc3 = st.columns([2, 2, 1])
-        search_q = fc1.text_input("🔍 Search parks", placeholder="e.g. Yellowstone, CA...")
-        states = sorted(all_parks_df['state'].dropna().unique().tolist())
-        state_filter = fc2.selectbox("Filter by State", ["All States"] + states)
-        wishlist_only = fc3.checkbox("❤️ Wishlist only")
-
-        filtered = all_parks_df
-        if search_q:
-            filtered = filtered[filtered['name'].str.contains(search_q, case=False, na=False) |
-                                 filtered['state'].str.contains(search_q, case=False, na=False)]
-        if state_filter != "All States":
-            filtered = filtered[filtered['state'] == state_filter]
-        if wishlist_only:
-            filtered = filtered[filtered['wishlisted'] == True]
-
-        st.caption(f"Showing {len(filtered)} parks")
-
-        for i in range(0, len(filtered), 3):
-            row_parks = filtered.iloc[i:i+3]
-            cols = st.columns(3)
-            for col, (_, park) in zip(cols, row_parks.iterrows()):
-                with col:
-                    with st.container(border=True):
-                        if park.get('image_url'):
-                            st.image(park['image_url'], use_container_width=True)
-                        alert_badge = f" 🚨 {alert_map[park['id']]} alert(s)" if park['id'] in alert_map else ""
-                        wishlist_icon = "❤️" if park['wishlisted'] else "🤍"
-                        st.markdown(f"**{park['name']}**{alert_badge}")
-                        st.caption(f"📍 {park['state']}")
-                        if park.get('entrance_fee_cost'):
-                            st.caption(f"💵 Entrance: ${park['entrance_fee_cost']}")
-                        with st.expander("ℹ️ Details"):
-                            if park.get('description'):
-                                st.write(park['description'][:400] + ("..." if len(str(park.get('description', ''))) > 400 else ""))
-                            if park.get('weather_info'):
-                                st.caption(f"🌤️ {park['weather_info'][:200]}")
-                            if park.get('visitor_center_hours'):
-                                st.caption(f"🕐 {park['visitor_center_hours'][:200]}")
-                            if park.get('activities'):
-                                try:
-                                    acts = json.loads(park['activities'])
-                                    st.caption("Activities: " + ", ".join(acts[:8]))
-                                except Exception:
-                                    pass
-                            if park['id'] in alert_map:
-                                with engine.connect() as conn:
-                                    park_alerts = conn.execute(text("""
-                                        SELECT title, category, description FROM alerts
-                                        WHERE park_id=:pid AND isactive=TRUE LIMIT 3
-                                    """), {"pid": park['id']}).fetchall()
-                                st.markdown("**🚨 Active Alerts:**")
-                                for a in park_alerts:
-                                    st.warning(f"**{a.category}:** {a.title}")
-                        if st.button(f"{wishlist_icon} {'Remove from' if park['wishlisted'] else 'Add to'} Wishlist",
-                                     key=f"wl_{park['id']}", use_container_width=True):
                             if park['wishlisted']:
-                                with engine.begin() as conn:
-                                    conn.execute(text("DELETE FROM park_wishlists WHERE user_id=:uid AND park_id=:pid"),
-                                                 {"uid": current_uid, "pid": park['id']})
+                                conn.execute(text("DELETE FROM park_wishlists WHERE user_id=:uid AND park_id=:pid"),
+                                             {"uid": current_uid, "pid": park['id']})
                             else:
-                                with engine.begin() as conn:
-                                    conn.execute(text("INSERT INTO park_wishlists (user_id, park_id) VALUES (:uid,:pid) ON CONFLICT DO NOTHING"),
-                                                 {"uid": current_uid, "pid": park['id']})
-                            st.rerun()
+                                conn.execute(text("INSERT INTO park_wishlists (user_id, park_id) VALUES (:uid,:pid) ON CONFLICT DO NOTHING"),
+                                             {"uid": current_uid, "pid": park['id']})
+                        get_wishlist_ids.clear()
+                        st.rerun()
 
-    # ─────────────────────────────────────────────
-    # MY STATS TAB
-    # ─────────────────────────────────────────────
-    with stats_tab:
-        st.header("📊 My Adventure Stats")
 
-        with engine.connect() as conn:
-            trip_count = conn.execute(text("""
-                SELECT COUNT(*) FROM trips t JOIN trip_participants tp ON t.id=tp.trip_id
-                WHERE tp.user_id=:uid AND tp.invitation_status='accepted' AND tp.role='owner'
-            """), {"uid": current_uid}).scalar() or 0
-            parks_visited = conn.execute(text("""
-                SELECT DISTINCT p.id, p.name, p.state FROM parks p
-                JOIN trip_parks tpk ON p.id=tpk.park_id JOIN trips t ON tpk.trip_id=t.id
-                JOIN trip_participants tp ON t.id=tp.trip_id
-                WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
-            """), {"uid": current_uid}).fetchall()
-            states_visited = list({p.state for p in parks_visited if p.state})
-            activity_count = conn.execute(text("""
-                SELECT COUNT(*) FROM trip_activities ta JOIN trips t ON ta.trip_id=t.id
-                JOIN trip_participants tp ON t.id=tp.trip_id
-                WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
-            """), {"uid": current_uid}).scalar() or 0
-            note_count = conn.execute(text("SELECT COUNT(*) FROM trip_day_notes WHERE author_id=:uid"), {"uid": current_uid}).scalar() or 0
-            friend_count = conn.execute(text("""
-                SELECT COUNT(*) FROM friendships WHERE (user_id=:uid OR friend_id=:uid) AND status='accepted'
-            """), {"uid": current_uid}).scalar() or 0
-            wishlist_count = conn.execute(text("SELECT COUNT(*) FROM park_wishlists WHERE user_id=:uid"), {"uid": current_uid}).scalar() or 0
-            earned_badges = conn.execute(text("""
-                SELECT badge_key, badge_name, badge_description, earned_at
-                FROM user_badges WHERE user_id=:uid ORDER BY earned_at DESC
-            """), {"uid": current_uid}).fetchall()
+def render_stats(current_uid):
+    st.header("📊 My Adventure Stats")
+    s = get_stats(current_uid)
 
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("🏕️ Trips", trip_count)
-        m2.metric("🌲 Parks", len(parks_visited))
-        m3.metric("🗺️ States", len(states_visited))
-        m4.metric("⚡ Activities", activity_count)
-        m5.metric("📝 Notes", note_count)
-        m6.metric("🤝 Friends", friend_count)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("🏕️ Trips", s["trip_count"])
+    m2.metric("🌲 Parks", len(s["parks_visited"]))
+    m3.metric("🗺️ States", len(s["states_visited"]))
+    m4.metric("⚡ Activities", s["activity_count"])
+    m5.metric("📝 Notes", s["note_count"])
+    m6.metric("🤝 Friends", s["friend_count"])
 
-        st.divider()
-        left_col, right_col = st.columns(2)
+    st.divider()
+    left_col, right_col = st.columns(2)
 
-        with left_col:
-            st.subheader("🌲 Parks Visited")
-            if parks_visited:
-                for p in sorted(parks_visited, key=lambda x: x.name):
-                    st.caption(f"✅ {p.name} — {p.state}")
-            else:
-                st.info("No parks visited yet. Plan your first trip!")
-            st.subheader("🗺️ States Explored")
-            if states_visited:
-                st.write(", ".join(sorted(states_visited)))
-            else:
-                st.info("No states yet!")
-            st.subheader("❤️ Wishlist")
-            st.caption(f"{wishlist_count} park(s) on your wishlist — check the Park Explorer tab!")
-
-        with right_col:
-            st.subheader("🏅 Badges")
-            earned_keys = {b.badge_key for b in earned_badges}
-            if earned_badges:
-                st.markdown("**Earned:**")
-                badge_cols = st.columns(2)
-                for bi, badge in enumerate(earned_badges):
-                    with badge_cols[bi % 2]:
-                        with st.container(border=True):
-                            st.markdown(f"**{badge.badge_name}**")
-                            st.caption(badge.badge_description)
-                            ts = badge.earned_at.strftime('%b %d, %Y') if hasattr(badge.earned_at, 'strftime') else str(badge.earned_at)
-                            st.caption(f"Earned {ts}")
-            locked = [b for b in BADGE_DEFINITIONS if b[0] not in earned_keys]
-            if locked:
-                st.markdown("**Locked 🔒:**")
-                for b in locked:
-                    st.caption(f"🔒 {b[1]} — {b[2]}")
-
-    # ─────────────────────────────────────────────
-    # FRIENDS TAB
-    # ─────────────────────────────────────────────
-    with friend_tab:
-        st.header("Social Hub")
-
-        f_search = st.text_input("Search by username, first name, or last name").strip()
-        if f_search:
-            with engine.connect() as conn:
-                search_results = conn.execute(text("""
-                    SELECT u.id, u.username, u.firstname, u.lastname, u.likes,
-                        CASE
-                            WHEN f.id IS NOT NULL AND f.status='accepted' THEN 'friends'
-                            WHEN f.id IS NOT NULL AND f.status='pending' AND f.user_id=:uid THEN 'request_sent'
-                            WHEN f.id IS NOT NULL AND f.status='pending' AND f.friend_id=:uid THEN 'request_received'
-                            ELSE 'none'
-                        END AS friendship_status
-                    FROM users u
-                    LEFT JOIN friendships f ON (f.user_id=:uid AND f.friend_id=u.id) OR (f.friend_id=:uid AND f.user_id=u.id)
-                    WHERE u.id!=:uid
-                      AND (LOWER(u.username) LIKE LOWER(:q) OR LOWER(u.firstname) LIKE LOWER(:q) OR LOWER(u.lastname) LIKE LOWER(:q))
-                    ORDER BY u.firstname, u.lastname LIMIT 20
-                """), {"uid": current_uid, "q": f"%{f_search}%"}).fetchall()
-
-            if not search_results:
-                st.info("No users found matching that search.")
-            else:
-                for res in search_results:
-                    with st.container(border=True):
-                        rc1, rc2 = st.columns([4, 1])
-                        rc1.markdown(f"**{res.firstname} {res.lastname}** (@{res.username})")
-                        if res.likes:
-                            rc1.caption(f"Style: {res.likes}")
-                        if res.friendship_status == "friends":
-                            rc2.success("✅ Friends")
-                        elif res.friendship_status == "request_sent":
-                            rc2.info("⏳ Sent")
-                        elif res.friendship_status == "request_received":
-                            rc2.warning("📬 Accept?")
-                            if rc2.button("Accept", key=f"search_accept_{res.id}"):
-                                with engine.begin() as conn:
-                                    conn.execute(text("UPDATE friendships SET status='accepted' WHERE user_id=:them AND friend_id=:me"), {"them": res.id, "me": current_uid})
-                                mark_badges_dirty()
-                                st.rerun()
-                        else:
-                            if rc2.button("➕ Add", key=f"search_add_{res.id}"):
-                                try:
-                                    with engine.begin() as conn:
-                                        conn.execute(text("INSERT INTO friendships (user_id, friend_id, status) VALUES (:u,:f,'pending')"), {"u": current_uid, "f": res.id})
-                                    st.toast(f"Friend request sent to {res.firstname}!")
-                                    st.rerun()
-                                except Exception:
-                                    st.warning("Request already exists.")
-
-        st.divider()
-        st.subheader("Your Adventure Crew")
-        with engine.connect() as conn:
-            my_friends = conn.execute(text("""
-                SELECT u.id, u.username, u.firstname, u.likes, f.id AS friendship_id
-                FROM users u JOIN friendships f ON (u.id=f.friend_id OR u.id=f.user_id)
-                WHERE (f.user_id=:uid OR f.friend_id=:uid) AND f.status='accepted' AND u.id!=:uid
-            """), {"uid": current_uid}).fetchall()
-
-        if not my_friends:
-            st.info("No friends yet. Use the search above to grow your crew!")
+    with left_col:
+        st.subheader("🌲 Parks Visited")
+        if s["parks_visited"]:
+            for p in sorted(s["parks_visited"], key=lambda x: x.name):
+                st.caption(f"✅ {p.name} — {p.state}")
         else:
-            for f in my_friends:
+            st.info("No parks visited yet. Plan your first trip!")
+        st.subheader("🗺️ States Explored")
+        st.write(", ".join(sorted(s["states_visited"])) if s["states_visited"] else "No states yet!")
+        st.subheader("❤️ Wishlist")
+        st.caption(f"{s['wishlist_count']} park(s) on your wishlist — check the Park Explorer tab!")
+
+    with right_col:
+        st.subheader("🏅 Badges")
+        earned_keys = {b.badge_key for b in s["earned_badges"]}
+        if s["earned_badges"]:
+            st.markdown("**Earned:**")
+            badge_cols = st.columns(2)
+            for bi, badge in enumerate(s["earned_badges"]):
+                with badge_cols[bi % 2]:
+                    with st.container(border=True):
+                        st.markdown(f"**{badge.badge_name}**")
+                        st.caption(badge.badge_description)
+                        ts = badge.earned_at.strftime('%b %d, %Y') if hasattr(badge.earned_at, 'strftime') else str(badge.earned_at)
+                        st.caption(f"Earned {ts}")
+        locked = [b for b in BADGE_DEFINITIONS if b[0] not in earned_keys]
+        if locked:
+            st.markdown("**Locked 🔒:**")
+            for b in locked:
+                st.caption(f"🔒 {b[1]} — {b[2]}")
+
+
+def render_friends(current_uid):
+    st.header("Social Hub")
+
+    f_search = st.text_input("Search by username, first name, or last name").strip()
+    if f_search:
+        search_results = search_users(current_uid, f_search)
+        if not search_results:
+            st.info("No users found matching that search.")
+        else:
+            for res in search_results:
                 with st.container(border=True):
-                    fc1, fc2 = st.columns([4, 1])
-                    fc1.write(f"**{f.firstname}** (@{f.username})")
-                    fc1.caption(f"Style: {f.likes}")
-                    confirm_key = f"confirm_del_friend_{f.friendship_id}"
-                    if confirm_key not in st.session_state:
-                        st.session_state[confirm_key] = False
-                    if not st.session_state[confirm_key]:
-                        if fc2.button("🗑️", key=f"del_friend_btn_{f.friendship_id}", help="Remove friend"):
-                            st.session_state[confirm_key] = True
+                    rc1, rc2 = st.columns([4, 1])
+                    rc1.markdown(f"**{res.firstname} {res.lastname}** (@{res.username})")
+                    if res.likes:
+                        rc1.caption(f"Style: {res.likes}")
+                    if res.friendship_status == "friends":
+                        rc2.success("✅ Friends")
+                    elif res.friendship_status == "request_sent":
+                        rc2.info("⏳ Sent")
+                    elif res.friendship_status == "request_received":
+                        rc2.warning("📬 Accept?")
+                        if rc2.button("Accept", key=f"search_accept_{res.id}"):
+                            with engine.begin() as conn:
+                                conn.execute(text("UPDATE friendships SET status='accepted' WHERE user_id=:them AND friend_id=:me"), {"them": res.id, "me": current_uid})
+                            search_users.clear(); get_friends.clear(); get_notifications_data.clear(); get_pending_count.clear()
+                            mark_badges_dirty()
                             st.rerun()
                     else:
-                        fc2.warning(f"Remove **{f.firstname}**?")
-                        cf1, cf2 = fc2.columns(2)
-                        if cf1.button("Yes", key=f"confirm_yes_friend_{f.friendship_id}"):
-                            with engine.begin() as conn:
-                                conn.execute(text("DELETE FROM friendships WHERE id=:fid"), {"fid": f.friendship_id})
-                            st.session_state[confirm_key] = False
-                            st.success("Friend removed.")
-                            st.rerun()
-                        if cf2.button("No", key=f"confirm_no_friend_{f.friendship_id}"):
-                            st.session_state[confirm_key] = False
-                            st.rerun()
+                        if rc2.button("➕ Add", key=f"search_add_{res.id}"):
+                            try:
+                                with engine.begin() as conn:
+                                    conn.execute(text("INSERT INTO friendships (user_id, friend_id, status) VALUES (:u,:f,'pending')"), {"u": current_uid, "f": res.id})
+                                search_users.clear()
+                                st.toast(f"Friend request sent to {res.firstname}!")
+                                st.rerun()
+                            except Exception:
+                                st.warning("Request already exists.")
 
+    st.divider()
+    st.subheader("Your Adventure Crew")
+    my_friends = get_friends(current_uid)
+
+    if not my_friends:
+        st.info("No friends yet. Use the search above to grow your crew!")
+    else:
+        for f in my_friends:
+            with st.container(border=True):
+                fc1, fc2 = st.columns([4, 1])
+                fc1.write(f"**{f.firstname}** (@{f.username})")
+                fc1.caption(f"Style: {f.likes}")
+                confirm_key = f"confirm_del_friend_{f.friendship_id}"
+                st.session_state.setdefault(confirm_key, False)
+                if not st.session_state[confirm_key]:
+                    if fc2.button("🗑️", key=f"del_friend_btn_{f.friendship_id}", help="Remove friend"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+                else:
+                    fc2.warning(f"Remove **{f.firstname}**?")
+                    cf1, cf2 = fc2.columns(2)
+                    if cf1.button("Yes", key=f"confirm_yes_friend_{f.friendship_id}"):
+                        with engine.begin() as conn:
+                            conn.execute(text("DELETE FROM friendships WHERE id=:fid"), {"fid": f.friendship_id})
+                        st.session_state[confirm_key] = False
+                        get_friends.clear()
+                        st.success("Friend removed.")
+                        st.rerun()
+                    if cf2.button("No", key=f"confirm_no_friend_{f.friendship_id}"):
+                        st.session_state[confirm_key] = False
+                        st.rerun()
+
+    st.divider()
+    st.subheader("Incoming Friend Requests")
+    pending = get_incoming_friend_requests(current_uid)
+    if not pending:
+        st.info("No pending friend requests.")
+    for req in pending:
+        c1, c2 = st.columns([0.7, 0.3])
+        c1.write(f"Request from **{req.firstname} {req.lastname}** (@{req.username})")
+        if c2.button("Accept ✅", key=f"acc_friend_{req.id}"):
+            with engine.begin() as conn:
+                conn.execute(text("UPDATE friendships SET status='accepted' WHERE id=:rid"), {"rid": req.id})
+            get_incoming_friend_requests.clear(); get_friends.clear(); get_pending_count.clear()
+            mark_badges_dirty()
+            st.rerun()
+
+
+def render_plan_trip(current_uid):
+    friend_options = get_friend_options(current_uid)
+    templates = get_templates(current_uid)
+    df_parks = get_park_name_id_df()
+
+    if templates:
+        st.markdown("**📋 Start from a Template**")
+        tmpl_options = {f"{t.trip_name} ({t.park_names})": t for t in templates}
+        chosen_tmpl = st.selectbox("Choose template", ["— New trip —"] + list(tmpl_options.keys()), key="template_select")
+        if chosen_tmpl != "— New trip —" and st.button("📋 Load Template"):
+            tmpl = tmpl_options[chosen_tmpl]
+            tmpl_parks = [p.strip() for p in (tmpl.park_names or "").split(",") if p.strip()]
+            st.session_state["selected_parks"] = tmpl_parks
+            st.toast(f"Loaded template: {tmpl.trip_name}")
+            st.rerun()
         st.divider()
-        st.subheader("Incoming Friend Requests")
-        with engine.connect() as conn:
-            pending = conn.execute(text("""
-                SELECT f.id, u.username, u.firstname, u.lastname FROM friendships f
-                JOIN users u ON f.user_id=u.id WHERE f.friend_id=:uid AND f.status='pending'
-            """), {"uid": current_uid}).fetchall()
 
-        if not pending:
-            st.info("No pending friend requests.")
-        for req in pending:
-            c1, c2 = st.columns([0.7, 0.3])
-            c1.write(f"Request from **{req.firstname} {req.lastname}** (@{req.username})")
-            if c2.button("Accept ✅", key=f"acc_friend_{req.id}"):
-                with engine.begin() as conn:
-                    conn.execute(text("UPDATE friendships SET status='accepted' WHERE id=:rid"), {"rid": req.id})
-                mark_badges_dirty()
-                st.rerun()
+    st.markdown("**Select Parks** _(choose one or more)_")
+    selected_parks = st.multiselect(
+        "Parks", options=df_parks['name'].tolist(),
+        placeholder="Search and add parks...", label_visibility="collapsed", key="selected_parks"
+    )
 
-    # ─────────────────────────────────────────────
-    # PLAN TRIP TAB
-    # ─────────────────────────────────────────────
-    with plan_tab:
-        with engine.connect() as conn:
-            friends_res = conn.execute(text("""
-                SELECT u.id, u.username FROM users u
-                JOIN friendships f ON (u.id=f.friend_id OR u.id=f.user_id)
-                WHERE ((f.user_id=:uid OR f.friend_id=:uid) AND f.status='accepted') AND u.id!=:uid
-            """), {"uid": current_uid}).fetchall()
-            friend_options = {fr[1]: fr[0] for fr in friends_res}
-            templates = conn.execute(text("""
-                SELECT t.id, t.trip_name, t.start_date, t.end_date,
-                       STRING_AGG(p.name, ', ' ORDER BY p.name) AS park_names
-                FROM trips t JOIN trip_participants tp ON t.id=tp.trip_id
-                LEFT JOIN trip_parks tpk ON t.id=tpk.trip_id LEFT JOIN parks p ON tpk.park_id=p.id
-                WHERE tp.user_id=:uid AND t.is_template=TRUE AND tp.role='owner'
-                GROUP BY t.id, t.trip_name, t.start_date, t.end_date ORDER BY t.trip_name
-            """), {"uid": current_uid}).fetchall()
-        df_parks = get_park_name_id_df()  # cached
+    if not selected_parks:
+        st.info("Select at least one park to get started.")
 
-        if templates:
-            st.markdown("**📋 Start from a Template**")
-            tmpl_options = {f"{t.trip_name} ({t.park_names})": t for t in templates}
-            chosen_tmpl = st.selectbox("Choose template", ["— New trip —"] + list(tmpl_options.keys()), key="template_select")
-            if chosen_tmpl != "— New trip —" and st.button("📋 Load Template"):
-                tmpl = tmpl_options[chosen_tmpl]
-                tmpl_parks = [p.strip() for p in (tmpl.park_names or "").split(",") if p.strip()]
-                st.session_state["selected_parks"] = tmpl_parks
-                st.toast(f"Loaded template: {tmpl.trip_name}")
-                st.rerun()
-            st.divider()
+    date_range = st.date_input("Dates", value=(date.today(), date.today()))
+    if len(date_range) == 2 and date_range[1] < date_range[0]:
+        st.error("End date must be on or after start date.")
+        date_range = (date_range[0], date_range[0])
 
-        st.markdown("**Select Parks** _(choose one or more)_")
-        selected_parks = st.multiselect(
-            "Parks", options=df_parks['name'].tolist(),
-            placeholder="Search and add parks...",
-            label_visibility="collapsed",
-            key="selected_parks"
-        )
+    st.markdown("**Invite Friends**")
+    invite_roles = {}
+    if friend_options:
+        for fname in friend_options:
+            col1, col2 = st.columns([0.6, 0.4])
+            if col1.checkbox(fname, key=f"invite_check_{fname}"):
+                invite_roles[fname] = col2.selectbox("Role", ["collaborator", "viewer"], key=f"invite_role_{fname}")
+    else:
+        st.caption("Add friends to invite them on trips.")
 
-        if not selected_parks:
-            st.info("Select at least one park to get started.")
-
-        date_range = st.date_input("Dates", value=(date.today(), date.today()))
-        if len(date_range) == 2 and date_range[1] < date_range[0]:
-            st.error("End date must be on or after start date.")
-            date_range = (date_range[0], date_range[0])
-
-        st.markdown("**Invite Friends**")
-        invite_roles = {}
-        if friend_options:
-            for fname in friend_options:
-                col1, col2 = st.columns([0.6, 0.4])
-                if col1.checkbox(fname, key=f"invite_check_{fname}"):
-                    invite_roles[fname] = col2.selectbox("Role", ["collaborator", "viewer"], key=f"invite_role_{fname}")
+    if st.button("🔍 Generate Plan", disabled=not selected_parks):
+        if len(date_range) < 2:
+            st.error("Please select a date range.")
         else:
-            st.caption("Add friends to invite them on trips.")
+            nights = (date_range[1] - date_range[0]).days
+            st.session_state.nights = nights
+            st.session_state.trip_start = date_range[0]
+            st.session_state.trip_end = date_range[1]
+            st.session_state.day_activities = {i + 1: [] for i in range(nights + 1)}
+            st.session_state.activity_day_defaults = {}
+            st.session_state.park_distances = []
+            st.session_state.conflict_warnings = {}
+            st.session_state.active_parks_saved = list(selected_parks)
 
-        if st.button("🔍 Generate Plan", disabled=not selected_parks):
-            if len(date_range) < 2:
-                st.error("Please select a date range.")
-            elif not selected_parks:
-                st.error("Please select at least one park.")
-            else:
-                nights = (date_range[1] - date_range[0]).days
-                st.session_state.nights = nights
-                st.session_state.trip_start = date_range[0]
-                st.session_state.trip_end = date_range[1]
-                st.session_state.day_activities = {i + 1: [] for i in range(nights + 1)}
-                st.session_state.activity_day_defaults = {}
-                st.session_state.park_distances = []
-                st.session_state.conflict_warnings = {}
-                st.session_state.active_parks_saved = list(selected_parks)
+            parks_label = ", ".join(selected_parks)
+            travel_styles = [f"{st.session_state.user_info['firstname']}: {st.session_state.user_info['likes']}"]
+            if invite_roles:
+                with engine.connect() as conn:
+                    friend_rows = conn.execute(text("SELECT firstname, likes FROM users WHERE username = ANY(:names)"),
+                                                {"names": list(invite_roles.keys())}).fetchall()
+                for fr in friend_rows:
+                    if fr.likes:
+                        travel_styles.append(f"{fr.firstname}: {fr.likes}")
 
-                parks_label = ", ".join(selected_parks)
-                travel_styles = [f"{st.session_state.user_info['firstname']}: {st.session_state.user_info['likes']}"]
-                if invite_roles:
-                    # FIX: batched lookup instead of one query per invited friend
-                    with engine.connect() as conn:
-                        friend_rows = conn.execute(
-                            text("SELECT firstname, likes FROM users WHERE username = ANY(:names)"),
-                            {"names": list(invite_roles.keys())}
-                        ).fetchall()
-                    for fr in friend_rows:
-                        if fr.likes:
-                            travel_styles.append(f"{fr.firstname}: {fr.likes}")
+            group_note = (f"This is a group trip. Balance activities for everyone's styles:\n" +
+                          "\n".join(f"  - {s}" for s in travel_styles)) if len(travel_styles) > 1 else f"Travel Style: {st.session_state.user_info['likes']}"
+            itinerary_context = (f"a {nights}-night trip at {selected_parks[0]}" if len(selected_parks) == 1
+                                 else f"a {nights}-night multi-park trip visiting {parks_label}. Distribute days across parks logically.")
 
-                group_note = (f"This is a group trip. Balance activities for everyone's styles:\n" +
-                              "\n".join(f"  - {s}" for s in travel_styles)) if len(travel_styles) > 1 else f"Travel Style: {st.session_state.user_info['likes']}"
-                parks_context = f"the park: {selected_parks[0]}" if len(selected_parks) == 1 else f"these parks: {parks_label}"
-                itinerary_context = (f"a {nights}-night trip at {selected_parks[0]}" if len(selected_parks) == 1
-                                     else f"a {nights}-night multi-park trip visiting {parks_label}. Distribute days across parks logically.")
-
-                prompt = f"""Trip context: {itinerary_context}
+            prompt = f"""Trip context: {itinerary_context}
 {group_note}
 
 You must respond in EXACTLY two sections. The sections are separated by the token <<<ITINERARY_SPLIT>>> on its own line. Do not omit or alter this token.
 
 SECTION 1 — output ONLY 12 lines, each in this exact format (no headers, no blank lines, no other text):
-Activity Name | Activity Type | Park Name | Brief description
 Activity Name | Activity Type | Park Name | Brief description
 (12 lines total, every line must contain exactly 3 pipe characters)
 
@@ -1345,1180 +1517,1014 @@ Activity Name | Activity Type | Park Name | Brief description
 
 SECTION 2 — Full day-by-day itinerary. Label each day as "Day 1", "Day 2", etc. List activities under each day.
 """
-                with st.spinner("Scouting the trail..."):
-                    resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text
-                    split_token = "<<<ITINERARY_SPLIT>>>"
-                    if split_token in resp:
-                        raw_acts, raw_itinerary = resp.split(split_token, 1)
-                    else:
-                        lines = resp.strip().split('\n')
-                        act_lines = [l for l in lines if l.count('|') >= 3]
-                        other_lines = [l for l in lines if l.count('|') < 3]
-                        raw_acts = '\n'.join(act_lines)
-                        raw_itinerary = '\n'.join(other_lines)
+            with st.spinner("Scouting the trail..."):
+                resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text
+                split_token = "<<<ITINERARY_SPLIT>>>"
+                if split_token in resp:
+                    raw_acts, raw_itinerary = resp.split(split_token, 1)
+                else:
+                    lines = resp.strip().split('\n')
+                    raw_acts = '\n'.join(l for l in lines if l.count('|') >= 3)
+                    raw_itinerary = '\n'.join(l for l in lines if l.count('|') < 3)
 
-                    st.session_state.temp_activities = [
-                        l.strip() for l in raw_acts.strip().split('\n')
-                        if l.strip() and l.count('|') >= 3
-                    ]
-                    st.session_state.master_itinerary = raw_itinerary.strip()
+                st.session_state.temp_activities = [
+                    l.strip() for l in raw_acts.strip().split('\n') if l.strip() and l.count('|') >= 3
+                ]
+                st.session_state.master_itinerary = raw_itinerary.strip()
 
-                    num_days = nights + 1
-                    day_map = parse_activity_day_defaults(st.session_state.master_itinerary, num_days)
-                    defaults = {}
-                    for i, act in enumerate(st.session_state.temp_activities):
-                        act_name = act.split('|')[0].strip()
-                        suggested = guess_day_for_activity(act_name, day_map, default_day=1)
-                        defaults[i] = suggested
-                        defaults[str(i)] = suggested
-                        widget_key = f"target_day_{i}"
-                        if widget_key in st.session_state:
-                            del st.session_state[widget_key]
-                    st.session_state.activity_day_defaults = defaults
-
-                if len(selected_parks) > 1:
-                    with st.spinner("Calculating park distances..."):
-                        st.session_state.park_distances = fetch_park_distances(selected_parks)
-
-        if st.session_state.park_distances:
-            st.divider()
-            st.subheader("🚗 Park-to-Park Drive Times")
-            dist_cols = st.columns(len(st.session_state.park_distances))
-            for idx, leg in enumerate(st.session_state.park_distances):
-                with dist_cols[idx]:
-                    with st.container(border=True):
-                        st.markdown(f"**{leg.get('from','?')} → {leg.get('to','?')}**")
-                        st.metric("Drive Time", leg.get("drive_time", "—"))
-                        st.caption(f"~{leg.get('distance_miles','?')} miles")
-                        if leg.get("tip"):
-                            st.caption(f"💡 {leg['tip']}")
-
-        active_parks = st.session_state.active_parks_saved or st.session_state.get("selected_parks") or selected_parks
-        board_start = st.session_state.trip_start
-        board_end = st.session_state.trip_end
-
-        if st.session_state.temp_activities and board_start and board_end:
-            st.divider()
-            days = date_range_days(board_start, board_end)
-            day_options = [d[0] for d in days]
-            st.session_state.conflict_warnings = compute_conflict_warnings(st.session_state.day_activities)
-
-            left, right = st.columns([1, 2])
-
-            with left:
-                st.subheader("💡 Suggested Activities")
-                # FIX: batched image lookup instead of one query per park
-                if active_parks:
-                    with engine.connect() as conn:
-                        img_rows = conn.execute(
-                            text("SELECT name, image_url FROM parks WHERE name = ANY(:names)"),
-                            {"names": list(active_parks)}
-                        ).fetchall()
-                    img_map = {r.name: r.image_url for r in img_rows}
-                    for park_name in active_parks:
-                        if img_map.get(park_name):
-                            st.image(img_map[park_name], caption=park_name, use_container_width=True)
-
-                sorted_activities = []
+                num_days = nights + 1
+                day_map = parse_activity_day_defaults(st.session_state.master_itinerary, num_days)
+                defaults = {}
                 for i, act in enumerate(st.session_state.temp_activities):
-                    parts = act.split('|')
-                    name = parts[0].strip()
-                    a_type = parts[1].strip() if len(parts) > 1 else "Activity"
-                    a_park = parts[2].strip() if len(parts) > 2 else ""
-                    raw = st.session_state.activity_day_defaults.get(i, st.session_state.activity_day_defaults.get(str(i), 1))
-                    suggested_day = raw if raw in day_options else (day_options[0] if day_options else 1)
-                    sorted_activities.append((i, name, a_type, a_park, suggested_day))
-                sorted_activities.sort(key=lambda x: x[4])
+                    act_name = act.split('|')[0].strip()
+                    suggested = guess_day_for_activity(act_name, day_map, default_day=1)
+                    defaults[i] = suggested
+                    defaults[str(i)] = suggested
+                    st.session_state.pop(f"target_day_{i}", None)
+                st.session_state.activity_day_defaults = defaults
 
-                if st.button("✅ Apply All to Trip", use_container_width=True):
-                    added = 0
-                    for i, name, a_type, a_park, suggested_day in sorted_activities:
-                        target = st.session_state.get(f"target_day_{i}", suggested_day)
-                        if target not in st.session_state.day_activities:
-                            st.session_state.day_activities[target] = []
-                        if name not in [a["name"] for a in st.session_state.day_activities[target]]:
-                            st.session_state.day_activities[target].append({"id": f"act_{i}_{target}", "name": name, "type": a_type})
-                            added += 1
-                    st.toast(f"Added {added} activities to your itinerary! 🎒")
+            if len(selected_parks) > 1:
+                with st.spinner("Calculating park distances..."):
+                    st.session_state.park_distances = fetch_park_distances(selected_parks)
+
+    if st.session_state.park_distances:
+        st.divider()
+        st.subheader("🚗 Park-to-Park Drive Times")
+        dist_cols = st.columns(len(st.session_state.park_distances))
+        for idx, leg in enumerate(st.session_state.park_distances):
+            with dist_cols[idx]:
+                with st.container(border=True):
+                    st.markdown(f"**{leg.get('from','?')} → {leg.get('to','?')}**")
+                    st.metric("Drive Time", leg.get("drive_time", "—"))
+                    st.caption(f"~{leg.get('distance_miles','?')} miles")
+                    if leg.get("tip"):
+                        st.caption(f"💡 {leg['tip']}")
+
+    active_parks = st.session_state.active_parks_saved or st.session_state.get("selected_parks") or selected_parks
+    board_start, board_end = st.session_state.trip_start, st.session_state.trip_end
+
+    if st.session_state.temp_activities and board_start and board_end:
+        st.divider()
+        days = date_range_days(board_start, board_end)
+        day_options = [d[0] for d in days]
+        st.session_state.conflict_warnings = compute_conflict_warnings(st.session_state.day_activities)
+
+        left, right = st.columns([1, 2])
+
+        with left:
+            st.subheader("💡 Suggested Activities")
+            if active_parks:
+                with engine.connect() as conn:
+                    img_rows = conn.execute(text("SELECT name, image_url FROM parks WHERE name = ANY(:names)"),
+                                             {"names": list(active_parks)}).fetchall()
+                img_map = {r.name: r.image_url for r in img_rows}
+                for park_name in active_parks:
+                    if img_map.get(park_name):
+                        st.image(img_map[park_name], caption=park_name, use_container_width=True)
+
+            sorted_activities = []
+            for i, act in enumerate(st.session_state.temp_activities):
+                parts = act.split('|')
+                name = parts[0].strip()
+                a_type = parts[1].strip() if len(parts) > 1 else "Activity"
+                a_park = parts[2].strip() if len(parts) > 2 else ""
+                raw = st.session_state.activity_day_defaults.get(i, st.session_state.activity_day_defaults.get(str(i), 1))
+                suggested_day = raw if raw in day_options else (day_options[0] if day_options else 1)
+                sorted_activities.append((i, name, a_type, a_park, suggested_day))
+            sorted_activities.sort(key=lambda x: x[4])
+
+            if st.button("✅ Apply All to Trip", use_container_width=True):
+                added = 0
+                for i, name, a_type, a_park, suggested_day in sorted_activities:
+                    target = st.session_state.get(f"target_day_{i}", suggested_day)
+                    st.session_state.day_activities.setdefault(target, [])
+                    if name not in [a["name"] for a in st.session_state.day_activities[target]]:
+                        st.session_state.day_activities[target].append({"id": f"act_{i}_{target}", "name": name, "type": a_type})
+                        added += 1
+                st.toast(f"Added {added} activities to your itinerary! 🎒")
+                st.rerun()
+
+            st.caption("Or add individually:")
+            current_day_label = None
+            for i, name, a_type, a_park, suggested_day in sorted_activities:
+                if suggested_day != current_day_label:
+                    current_day_label = suggested_day
+                    day_date = next((d[1] for d in days if d[0] == suggested_day), None)
+                    day_label = f"Day {suggested_day}" + (f" — {day_date.strftime('%a, %b %d')}" if day_date else "")
+                    st.markdown(f"**📅 {day_label}**")
+                default_index = day_options.index(suggested_day) if suggested_day in day_options else 0
+                with st.container(border=True):
+                    ac1, ac2, ac3 = st.columns([2, 2, 1])
+                    ac1.markdown(f"**{name}**")
+                    ac1.caption(f"{a_type}" + (f" · {a_park}" if a_park else ""))
+                    target_day = ac2.selectbox("Day", options=day_options, format_func=lambda d: f"Day {d}",
+                                                index=default_index, key=f"target_day_{i}")
+                    if ac3.button("➕", key=f"add_{i}"):
+                        st.session_state.day_activities.setdefault(target_day, [])
+                        if name not in [a["name"] for a in st.session_state.day_activities[target_day]]:
+                            st.session_state.day_activities[target_day].append({"id": f"act_{i}_{target_day}", "name": name, "type": a_type})
+                            st.toast(f"Added to Day {target_day}!")
+                            st.rerun()
+
+        with right:
+            st.subheader("📅 Day-by-Day Itinerary")
+            st.caption("Drag activities between days • Click ✕ to remove")
+
+            if st.session_state.conflict_warnings:
+                total = sum(len(v) for v in st.session_state.conflict_warnings.values())
+                with st.expander(f"⚠️ {total} scheduling conflict(s) detected — click to review", expanded=False):
+                    for day_num, warns in sorted(st.session_state.conflict_warnings.items()):
+                        st.markdown(f"**Day {day_num}**")
+                        for w in warns:
+                            st.markdown(f"&nbsp;&nbsp;{w}")
+
+            render_dnd_itinerary(st.session_state.day_activities, days, editable=True,
+                                 conflict_warnings=st.session_state.conflict_warnings)
+
+            st.divider()
+            if st.session_state.master_itinerary:
+                st.subheader("📖 AI Master Itinerary")
+                st.markdown(st.session_state.master_itinerary)
+                st.divider()
+
+            bcol1, bcol2 = st.columns(2)
+
+            if bcol1.button("💾 Save Trip", use_container_width=True):
+                if not active_parks:
+                    st.error("No parks selected.")
+                else:
+                    try:
+                        parks_label = ", ".join(active_parks)
+                        trip_name = f"{parks_label} Trip" if len(active_parks) == 1 else f"Multi-Park Trip: {parks_label}"
+                        park_id_map = dict(zip(df_parks['name'], df_parks['id']))
+                        with engine.begin() as conn:
+                            tid = conn.execute(text("""
+                                INSERT INTO trips (user_id, owner_id, trip_name, start_date, end_date)
+                                VALUES (:u,:u,:n,:s,:e) RETURNING id
+                            """), {"u": current_uid, "n": trip_name, "s": board_start, "e": board_end}).scalar()
+                            conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t,:u,'owner','accepted',:u)"),
+                                         {"t": tid, "u": current_uid})
+                            for f_name, f_role in invite_roles.items():
+                                fid = friend_options.get(f_name)
+                                if fid:
+                                    conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t,:u,:role,'pending',:inviter)"),
+                                                 {"t": tid, "u": fid, "role": f_role, "inviter": current_uid})
+                            for park_name in active_parks:
+                                p_id = park_id_map.get(park_name)
+                                if p_id is not None:
+                                    notes_text = f"MASTER ITINERARY:\n{st.session_state.master_itinerary}" if park_name == active_parks[0] else ""
+                                    conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t,:p,:n)"),
+                                                 {"t": tid, "p": int(p_id), "n": notes_text})
+                            for day_num, activities in st.session_state.day_activities.items():
+                                for order, act in enumerate(activities):
+                                    conn.execute(text("INSERT INTO trip_activities (trip_id, day_number, activity_name, activity_type, sort_order) VALUES (:tid,:day,:name,:atype,:order)"),
+                                                 {"tid": tid, "day": day_num, "name": act["name"], "atype": act.get("type", ""), "order": order})
+
+                        all_types = [act.get("type", "") for acts in st.session_state.day_activities.values() for act in acts]
+                        num_days_val = (board_end - board_start).days + 1
+                        with st.spinner("Packing your bags..."):
+                            packing_items = generate_packing_list(active_parks, all_types, num_days_val)
+                        if packing_items:
+                            with engine.begin() as conn:
+                                for item in packing_items:
+                                    conn.execute(text("INSERT INTO trip_packing_items (trip_id, category, item_name) VALUES (:tid,:cat,:item)"),
+                                                 {"tid": tid, "cat": item.get("category", "General"), "item": item.get("item", "")})
+
+                        st.success("Adventure locked in! 🎉")
+                        st.balloons()
+                        get_my_trips.clear(); load_trip_heavy_data.clear()
+                        mark_badges_dirty()
+                        for k in ["day_activities", "activity_day_defaults", "conflict_warnings"]:
+                            st.session_state[k] = {}
+                        for k in ["temp_activities", "park_distances", "active_parks_saved"]:
+                            st.session_state[k] = []
+                        for k in ["trip_start", "trip_end"]:
+                            st.session_state[k] = None
+                        st.session_state.master_itinerary = ""
+                        st.session_state.pop("selected_parks", None)
+
+                    except Exception as e:
+                        st.error(f"Database Error: {e}")
+
+            if bcol2.button("📋 Save as Template", use_container_width=True):
+                if not active_parks:
+                    st.error("No parks selected.")
+                else:
+                    try:
+                        tmpl_name = f"Template: {', '.join(active_parks)}"
+                        park_id_map = dict(zip(df_parks['name'], df_parks['id']))
+                        with engine.begin() as conn:
+                            tmpl_tid = conn.execute(text("""
+                                INSERT INTO trips (user_id, owner_id, trip_name, start_date, end_date, is_template)
+                                VALUES (:u,:u,:n,:s,:e,TRUE) RETURNING id
+                            """), {"u": current_uid, "n": tmpl_name, "s": board_start, "e": board_end}).scalar()
+                            conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t,:u,'owner','accepted',:u)"),
+                                         {"t": tmpl_tid, "u": current_uid})
+                            for park_name in active_parks:
+                                p_id = park_id_map.get(park_name)
+                                if p_id is not None:
+                                    conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t,:p,'')"),
+                                                 {"t": tmpl_tid, "p": int(p_id)})
+                            for day_num, activities in st.session_state.day_activities.items():
+                                for order, act in enumerate(activities):
+                                    conn.execute(text("INSERT INTO trip_activities (trip_id, day_number, activity_name, activity_type, sort_order) VALUES (:tid,:day,:name,:atype,:order)"),
+                                                 {"tid": tmpl_tid, "day": day_num, "name": act["name"], "atype": act.get("type", ""), "order": order})
+                        get_templates.clear()
+                        st.success(f"Template saved as '{tmpl_name}'! ✅")
+                    except Exception as e:
+                        st.error(f"Error saving template: {e}")
+
+
+def _render_trip_read_only(t, data, current_uid, editable, trip_start_d, trip_end_d):
+    saved_acts, all_notes_rows = data["acts"], data["notes"]
+    notes_by_day, day_act_map = {}, {}
+    for n in all_notes_rows:
+        notes_by_day.setdefault(n.day_number, []).append(n)
+    for a in saved_acts:
+        day_act_map.setdefault(a.day_number, []).append(a)
+
+    if data["alerts"]:
+        st.divider()
+        with st.expander(f"🚨 {len(data['alerts'])} active NPS alert(s) for this trip", expanded=False):
+            for al in data["alerts"]:
+                st.warning(f"**{al.park_name} — {al.category}:** {al.title}")
+                if al.description:
+                    st.caption(al.description[:300])
+
+    view_days = date_range_days(t.start_date, t.end_date)
+    st.divider()
+    st.markdown("**📅 Day-by-Day:**")
+    for day_num, day_date in view_days:
+        acts = day_act_map.get(day_num, [])
+        day_notes = notes_by_day.get(day_num, [])
+        with st.container(border=True):
+            st.markdown(f"**Day {day_num} — {day_date.strftime('%a, %b %d')}**")
+            if acts:
+                for a in acts:
+                    st.caption(f"  • {a.activity_name} _{a.activity_type}_")
+            else:
+                st.caption("  _(no activities planned)_")
+            if day_notes:
+                st.markdown("📝 **Notes:**")
+                for note in day_notes:
+                    is_mine = note.author_id == current_uid
+                    note_col1, note_col2 = st.columns([8, 1])
+                    ts = note.created_at.strftime('%b %d') if hasattr(note.created_at, 'strftime') else note.created_at
+                    note_col1.markdown(f"> {note.note_text}  \n<small>— {note.firstname} {note.lastname}, {ts}</small>", unsafe_allow_html=True)
+                    if is_mine and note_col2.button("🗑️", key=f"del_note_{note.id}"):
+                        with engine.begin() as conn2:
+                            conn2.execute(text("DELETE FROM trip_day_notes WHERE id=:nid"), {"nid": note.id})
+                        invalidate_trip_data(t.id)
+                        st.rerun()
+            new_note = st.text_input(f"Add a note for Day {day_num}", placeholder="How did it go? Any tips for future visitors?",
+                                      key=f"note_input_{t.id}_{day_num}", label_visibility="collapsed")
+            if st.button("💬 Add Note", key=f"add_note_{t.id}_{day_num}") and new_note.strip():
+                with engine.begin() as conn2:
+                    conn2.execute(text("INSERT INTO trip_day_notes (trip_id, day_number, author_id, note_text) VALUES (:tid,:day,:uid,:note)"),
+                                  {"tid": t.id, "day": day_num, "uid": current_uid, "note": new_note.strip()})
+                invalidate_trip_data(t.id)
+                mark_badges_dirty()
+                st.rerun()
+
+    packing_rows = data["packing"]
+    st.divider()
+    if packing_rows:
+        with st.expander("🎒 Packing List", expanded=False):
+            checked_count = sum(1 for p in packing_rows if p.is_checked)
+            total_count = len(packing_rows)
+            st.progress(checked_count / total_count if total_count else 0, text=f"{checked_count}/{total_count} items packed")
+            st.caption("Check items off as you pack!")
+            categories = {}
+            for row in packing_rows:
+                categories.setdefault(row.category, []).append(row)
+            pack_cols = st.columns(2)
+            for ci, (category, items) in enumerate(sorted(categories.items())):
+                with pack_cols[ci % 2]:
+                    st.markdown(f"**{category}**")
+                    for item in items:
+                        checked = st.checkbox(item.item_name, value=item.is_checked, key=f"pack_{item.id}")
+                        if checked != item.is_checked:
+                            with engine.begin() as conn2:
+                                conn2.execute(text("UPDATE trip_packing_items SET is_checked=:c WHERE id=:iid"), {"c": checked, "iid": item.id})
+                            invalidate_trip_data(t.id)
+                            mark_badges_dirty()
+                            st.rerun()
+    else:
+        with st.expander("🎒 Packing List", expanded=False):
+            st.caption("No packing list yet for this trip.")
+            if st.button("✨ Generate Packing List", key=f"gen_pack_{t.id}"):
+                pl_park_names = [tp.park_name for tp in data["trip_parks"]]
+                pl_act_types = [a.activity_type for a in saved_acts]
+                num_days_pl = (trip_end_d - trip_start_d).days + 1 if trip_end_d and trip_start_d else 1
+                with st.spinner("Packing your bags..."):
+                    new_items = generate_packing_list(pl_park_names, pl_act_types, num_days_pl)
+                if new_items:
+                    with engine.begin() as conn2:
+                        for item in new_items:
+                            conn2.execute(text("INSERT INTO trip_packing_items (trip_id, category, item_name) VALUES (:tid,:cat,:item)"),
+                                          {"tid": t.id, "cat": item.get("category", "General"), "item": item.get("item", "")})
+                    invalidate_trip_data(t.id)
+                    st.rerun()
+                else:
+                    st.error("Couldn't generate packing list. Try again.")
+
+    if trip_end_d and trip_end_d < date.today():
+        st.divider()
+        st.markdown("**✍️ Trip Recap**")
+        if t.recap_text:
+            st.markdown(t.recap_text)
+            if editable and st.button("🔄 Regenerate Recap", key=f"regen_recap_{t.id}"):
+                st.session_state[f"gen_recap_{t.id}"] = True
+                st.rerun()
+        else:
+            st.caption("This trip is in the past — generate a recap narrative!")
+        gen_key = f"gen_recap_{t.id}"
+        if st.session_state.get(gen_key) or not t.recap_text:
+            if st.button("🤖 Generate AI Recap", key=f"do_recap_{t.id}"):
+                with st.spinner("Writing your story..."):
+                    recap_acts = [{"day": a.day_number, "name": a.activity_name} for a in saved_acts]
+                    recap_notes = [{"day": n.day_number, "text": n.note_text} for n in all_notes_rows]
+                    park_names_list = [p.strip() for p in (t.park_names or "").split(",") if p.strip()]
+                    recap = generate_trip_recap(t.trip_name, park_names_list, recap_acts, recap_notes, trip_start_d, trip_end_d)
+                if recap:
+                    with engine.begin() as conn2:
+                        conn2.execute(text("UPDATE trips SET recap_text=:r WHERE id=:tid"), {"r": recap, "tid": t.id})
+                    st.session_state[gen_key] = False
+                    invalidate_trip_data(t.id)
+                    get_my_trips.clear()
+                    st.rerun()
+                else:
+                    st.error("Couldn't generate recap. Try again.")
+
+    if data["trip_parks"]:
+        st.divider()
+        for tp in data["trip_parks"]:
+            if tp.notes:
+                st.markdown(f"**📍 {tp.park_name}**")
+                st.markdown(tp.notes)
+
+
+def render_my_trips(current_uid):
+    st.header("Your Adventures")
+    trips = get_my_trips(current_uid)
+
+    if not trips:
+        st.info("No trips yet! Head to Plan Trip to start your first adventure 🏕️")
+        return
+
+    all_parks = get_park_name_id_df()
+
+    for t in trips:
+        role_badge = "👑 Owner" if t.role == "owner" else "✏️ Collaborator" if t.role == "collaborator" else "👁️ Viewer"
+        status_emoji, status_label, _ = trip_status(t.start_date, t.end_date)
+        trip_end_d = t.end_date if isinstance(t.end_date, date) else (date.fromisoformat(str(t.end_date)) if t.end_date else None)
+        trip_start_d = t.start_date if isinstance(t.start_date, date) else (date.fromisoformat(str(t.start_date)) if t.start_date else None)
+        editable = can_edit(t.role)
+
+        with st.expander(f"{status_emoji} {t.trip_name}  —  {role_badge}  ·  {status_label}"):
+            data = get_trip_data(t.id, trip_start_d)
+
+            if t.park_images:
+                imgs = [img for img in t.park_images.split('|') if img]
+                if imgs:
+                    img_cols = st.columns(min(len(imgs), 3))
+                    park_name_list = t.park_names.split(', ') if t.park_names else []
+                    for idx, img_url in enumerate(imgs[:3]):
+                        cap = park_name_list[idx] if idx < len(park_name_list) else ""
+                        img_cols[idx].image(img_url, caption=cap, use_container_width=True)
+
+            edit_key, confirm_del_key = f"editing_{t.id}", f"confirm_del_trip_{t.id}"
+            st.session_state.setdefault(edit_key, False)
+            st.session_state.setdefault(confirm_del_key, False)
+
+            col_info, col_btns = st.columns([3, 1])
+            with col_info:
+                st.caption(f"📅 {t.start_date} → {t.end_date}  •  🏔️ {t.park_names or 'No Parks'}")
+                if t.role != "owner":
+                    st.caption(f"Planned by **{t.owner_name}**")
+            with col_btns:
+                if editable:
+                    if st.button("Cancel" if st.session_state[edit_key] else "✏️ Edit", key=f"toggle_edit_{t.id}"):
+                        st.session_state[edit_key] = not st.session_state[edit_key]
+                        st.rerun()
+                all_notes_txt = "\n\n".join(f"=== {tp.park_name} ===\n{tp.notes}" for tp in data["trip_parks"] if tp.notes)
+                if all_notes_txt:
+                    pdf_b = create_pdf(all_notes_txt, t.trip_name, st.session_state.user_info['firstname'])
+                    st.download_button("📥 PDF", pdf_b, f"Trip_{t.id}.pdf", key=f"dl_{t.id}")
+                if t.role == "owner":
+                    if not st.session_state[confirm_del_key]:
+                        if st.button("🗑️ Delete", key=f"del_trip_btn_{t.id}"):
+                            st.session_state[confirm_del_key] = True
+                            st.rerun()
+                    else:
+                        st.warning("Delete this trip permanently?")
+                        dy, dn = st.columns(2)
+                        if dy.button("Yes, delete", key=f"confirm_del_yes_{t.id}"):
+                            with engine.begin() as conn:
+                                conn.execute(text("DELETE FROM trips WHERE id=:tid"), {"tid": t.id})
+                            st.session_state[confirm_del_key] = False
+                            get_my_trips.clear()
+                            invalidate_trip_data(t.id)
+                            st.success("Trip deleted.")
+                            st.rerun()
+                        if dn.button("Cancel", key=f"confirm_del_no_{t.id}"):
+                            st.session_state[confirm_del_key] = False
+                            st.rerun()
+
+            if editable and st.session_state[edit_key]:
+                st.divider()
+                st.markdown("### ✏️ Edit Trip")
+                new_name = st.text_input("Trip Name", value=t.trip_name, key=f"name_{t.id}")
+                start, end = trip_start_d or date.today(), trip_end_d or date.today()
+                new_dates = st.date_input("Dates", value=(start, end), key=f"dates_{t.id}")
+
+                st.markdown("**Parks**")
+                current_park_names = [tp.park_name for tp in data["trip_parks"]]
+                new_park_selection = st.multiselect("Select Parks", options=all_parks['name'].tolist(), default=current_park_names, key=f"parks_edit_{t.id}")
+
+                st.markdown("**Park Notes / Itinerary**")
+                existing_notes = {tp.park_name: tp.notes for tp in data["trip_parks"]}
+                park_notes_map = {pname: st.text_area(f"Notes for {pname}", value=existing_notes.get(pname, ""), height=150, key=f"notes_{t.id}_{pname}")
+                                   for pname in new_park_selection}
+
+                st.markdown("**Edit Day Activities**")
+                edit_days = date_range_days(start, end)
+                edit_day_acts = {d[0]: [] for d in edit_days}
+                for a in data["acts"]:
+                    if a.day_number in edit_day_acts:
+                        edit_day_acts[a.day_number].append({"id": str(a.id), "name": a.activity_name, "type": a.activity_type or ""})
+                render_dnd_itinerary(edit_day_acts, edit_days, editable=True)
+
+                st.markdown("**Add a new activity:**")
+                na1, na2, na3, na4 = st.columns([3, 2, 2, 1])
+                new_act_name = na1.text_input("Activity name", key=f"new_act_name_{t.id}")
+                new_act_type = na2.text_input("Type", key=f"new_act_type_{t.id}")
+                new_act_day = na3.selectbox("Day", [d[0] for d in edit_days], key=f"new_act_day_{t.id}")
+                if na4.button("Add", key=f"add_new_act_{t.id}") and new_act_name:
+                    with engine.begin() as conn2:
+                        max_order = conn2.execute(text("SELECT COALESCE(MAX(sort_order),0) FROM trip_activities WHERE trip_id=:tid AND day_number=:day"),
+                                                  {"tid": t.id, "day": new_act_day}).scalar()
+                        conn2.execute(text("INSERT INTO trip_activities (trip_id, day_number, activity_name, activity_type, sort_order) VALUES (:tid,:day,:name,:atype,:order)"),
+                                      {"tid": t.id, "day": new_act_day, "name": new_act_name, "atype": new_act_type, "order": max_order + 1})
+                    invalidate_trip_data(t.id)
                     st.rerun()
 
-                st.caption("Or add individually:")
-                current_day_label = None
-                for i, name, a_type, a_park, suggested_day in sorted_activities:
-                    if suggested_day != current_day_label:
-                        current_day_label = suggested_day
-                        day_date = next((d[1] for d in days if d[0] == suggested_day), None)
-                        day_label = f"Day {suggested_day}" + (f" — {day_date.strftime('%a, %b %d')}" if day_date else "")
-                        st.markdown(f"**📅 {day_label}**")
-                    default_index = day_options.index(suggested_day) if suggested_day in day_options else 0
-                    with st.container(border=True):
-                        ac1, ac2, ac3 = st.columns([2, 2, 1])
-                        ac1.markdown(f"**{name}**")
-                        ac1.caption(f"{a_type}" + (f" · {a_park}" if a_park else ""))
-                        target_day = ac2.selectbox(
-                            "Day", options=day_options,
-                            format_func=lambda d: f"Day {d}",
-                            index=default_index,
-                            key=f"target_day_{i}"
-                        )
-                        if ac3.button("➕", key=f"add_{i}"):
-                            if target_day not in st.session_state.day_activities:
-                                st.session_state.day_activities[target_day] = []
-                            if name not in [a["name"] for a in st.session_state.day_activities[target_day]]:
-                                st.session_state.day_activities[target_day].append({"id": f"act_{i}_{target_day}", "name": name, "type": a_type})
-                                st.toast(f"Added to Day {target_day}!")
-                                st.rerun()
-
-            with right:
-                st.subheader("📅 Day-by-Day Itinerary")
-                st.caption("Drag activities between days • Click ✕ to remove")
-
-                if st.session_state.conflict_warnings:
-                    total = sum(len(v) for v in st.session_state.conflict_warnings.values())
-                    with st.expander(f"⚠️ {total} scheduling conflict(s) detected — click to review", expanded=False):
-                        for day_num, warns in sorted(st.session_state.conflict_warnings.items()):
-                            st.markdown(f"**Day {day_num}**")
-                            for w in warns:
-                                st.markdown(f"&nbsp;&nbsp;{w}")
-
-                render_dnd_itinerary(st.session_state.day_activities, days, editable=True,
-                                     conflict_warnings=st.session_state.conflict_warnings)
-
-                st.divider()
-                if st.session_state.master_itinerary:
-                    st.subheader("📖 AI Master Itinerary")
-                    st.markdown(st.session_state.master_itinerary)
-                    st.divider()
-
-                bcol1, bcol2 = st.columns(2)
-
-                if bcol1.button("💾 Save Trip", use_container_width=True):
-                    if not active_parks:
-                        st.error("No parks selected.")
-                    else:
-                        try:
-                            parks_label = ", ".join(active_parks)
-                            trip_name = f"{parks_label} Trip" if len(active_parks) == 1 else f"Multi-Park Trip: {parks_label}"
-                            park_id_map = dict(zip(df_parks['name'], df_parks['id']))
-                            with engine.begin() as conn:
-                                tid = conn.execute(text("""
-                                    INSERT INTO trips (user_id, owner_id, trip_name, start_date, end_date)
-                                    VALUES (:u,:u,:n,:s,:e) RETURNING id
-                                """), {"u": current_uid, "n": trip_name, "s": board_start, "e": board_end}).scalar()
-                                conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t,:u,'owner','accepted',:u)"),
-                                             {"t": tid, "u": current_uid})
-                                for f_name, f_role in invite_roles.items():
-                                    fid = friend_options.get(f_name)
-                                    if fid:
-                                        conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t,:u,:role,'pending',:inviter)"),
-                                                     {"t": tid, "u": fid, "role": f_role, "inviter": current_uid})
-                                for park_name in active_parks:
-                                    p_id = park_id_map.get(park_name)
-                                    if p_id is not None:
-                                        notes_text = f"MASTER ITINERARY:\n{st.session_state.master_itinerary}" if park_name == active_parks[0] else ""
-                                        conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t,:p,:n)"),
-                                                     {"t": tid, "p": int(p_id), "n": notes_text})
-                                for day_num, activities in st.session_state.day_activities.items():
-                                    for order, act in enumerate(activities):
-                                        conn.execute(text("INSERT INTO trip_activities (trip_id, day_number, activity_name, activity_type, sort_order) VALUES (:tid,:day,:name,:atype,:order)"),
-                                                     {"tid": tid, "day": day_num, "name": act["name"], "atype": act.get("type", ""), "order": order})
-
-                            all_types = [act.get("type", "") for acts in st.session_state.day_activities.values() for act in acts]
-                            num_days_val = (board_end - board_start).days + 1
-                            with st.spinner("Packing your bags..."):
-                                packing_items = generate_packing_list(active_parks, all_types, num_days_val)
-                            if packing_items:
-                                with engine.begin() as conn:
-                                    for item in packing_items:
-                                        conn.execute(text("INSERT INTO trip_packing_items (trip_id, category, item_name) VALUES (:tid,:cat,:item)"),
-                                                     {"tid": tid, "cat": item.get("category", "General"), "item": item.get("item", "")})
-
-                            st.success("Adventure locked in! 🎉")
-                            st.balloons()
-                            mark_badges_dirty()
-                            for k in ["day_activities", "activity_day_defaults", "conflict_warnings"]:
-                                st.session_state[k] = {}
-                            for k in ["temp_activities", "park_distances", "active_parks_saved"]:
-                                st.session_state[k] = []
-                            for k in ["trip_start", "trip_end"]:
-                                st.session_state[k] = None
-                            st.session_state.master_itinerary = ""
-                            if "selected_parks" in st.session_state:
-                                del st.session_state["selected_parks"]
-
-                        except Exception as e:
-                            st.error(f"Database Error: {e}")
-
-                if bcol2.button("📋 Save as Template", use_container_width=True):
-                    if not active_parks:
-                        st.error("No parks selected.")
-                    else:
-                        try:
-                            parks_label = ", ".join(active_parks)
-                            tmpl_name = f"Template: {parks_label}"
-                            park_id_map = dict(zip(df_parks['name'], df_parks['id']))
-                            with engine.begin() as conn:
-                                tmpl_tid = conn.execute(text("""
-                                    INSERT INTO trips (user_id, owner_id, trip_name, start_date, end_date, is_template)
-                                    VALUES (:u,:u,:n,:s,:e,TRUE) RETURNING id
-                                """), {"u": current_uid, "n": tmpl_name, "s": board_start, "e": board_end}).scalar()
-                                conn.execute(text("INSERT INTO trip_participants (trip_id, user_id, role, invitation_status, invited_by) VALUES (:t,:u,'owner','accepted',:u)"),
-                                             {"t": tmpl_tid, "u": current_uid})
-                                for park_name in active_parks:
-                                    p_id = park_id_map.get(park_name)
-                                    if p_id is not None:
-                                        conn.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t,:p,'')"),
-                                                     {"t": tmpl_tid, "p": int(p_id)})
-                                for day_num, activities in st.session_state.day_activities.items():
-                                    for order, act in enumerate(activities):
-                                        conn.execute(text("INSERT INTO trip_activities (trip_id, day_number, activity_name, activity_type, sort_order) VALUES (:tid,:day,:name,:atype,:order)"),
-                                                     {"tid": tmpl_tid, "day": day_num, "name": act["name"], "atype": act.get("type", ""), "order": order})
-                            st.success(f"Template saved as '{tmpl_name}'! ✅")
-                        except Exception as e:
-                            st.error(f"Error saving template: {e}")
-
-    # ─────────────────────────────────────────────
-    # MY TRIPS TAB
-    # ─────────────────────────────────────────────
-    with my_trips_tab:
-        st.header("Your Adventures")
-
-        with engine.connect() as conn:
-            trips = conn.execute(text("""
-                SELECT DISTINCT t.id, t.trip_name, t.start_date, t.end_date,
-                       STRING_AGG(DISTINCT p.name, ', ' ORDER BY p.name) AS park_names,
-                       STRING_AGG(DISTINCT p.image_url, '|' ORDER BY p.image_url) AS park_images,
-                       u_owner.firstname || ' ' || u_owner.lastname AS owner_name,
-                       tp.role, t.recap_text, t.rating, t.review_text, t.is_public
-                FROM trips t
-                JOIN trip_participants tp ON t.id=tp.trip_id
-                JOIN users u_owner ON t.owner_id=u_owner.id
-                LEFT JOIN trip_parks tpk ON t.id=tpk.trip_id
-                LEFT JOIN parks p ON tpk.park_id=p.id
-                WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
-                  AND (t.is_template IS NULL OR t.is_template=FALSE)
-                GROUP BY t.id, t.trip_name, t.start_date, t.end_date, u_owner.firstname, u_owner.lastname, tp.role, t.recap_text, t.rating, t.review_text, t.is_public
-                ORDER BY t.start_date DESC
-            """), {"uid": current_uid}).fetchall()
-
-        if not trips:
-            st.info("No trips yet! Head to Plan Trip to start your first adventure 🏕️")
-        else:
-            all_parks = get_park_name_id_df()  # cached
-
-            for t in trips:
-                role_badge = "👑 Owner" if t.role == "owner" else "✏️ Collaborator" if t.role == "collaborator" else "👁️ Viewer"
-                status_emoji, status_label, _ = trip_status(t.start_date, t.end_date)
-                trip_end_d = t.end_date if isinstance(t.end_date, date) else (date.fromisoformat(str(t.end_date)) if t.end_date else None)
-                trip_start_d = t.start_date if isinstance(t.start_date, date) else (date.fromisoformat(str(t.start_date)) if t.start_date else None)
-                label = f"{status_emoji} {t.trip_name}  —  {role_badge}  ·  {status_label}"
-                editable = can_edit(t.role)
-
-                with st.expander(label):
-                    # Heavy per-trip data: fetched once, cached in session_state,
-                    # not requeried on every rerun (only when this trip changes).
-                    data = get_trip_data(t.id, trip_start_d)
-
-                    if t.park_images:
-                        imgs = [img for img in t.park_images.split('|') if img]
-                        if imgs:
-                            img_cols = st.columns(min(len(imgs), 3))
-                            park_name_list = t.park_names.split(', ') if t.park_names else []
-                            for idx, img_url in enumerate(imgs[:3]):
-                                cap = park_name_list[idx] if idx < len(park_name_list) else ""
-                                img_cols[idx].image(img_url, caption=cap, use_container_width=True)
-
-                    edit_key = f"editing_{t.id}"
-                    confirm_del_key = f"confirm_del_trip_{t.id}"
-                    for k, v in [(edit_key, False), (confirm_del_key, False)]:
-                        if k not in st.session_state:
-                            st.session_state[k] = v
-
-                    col_info, col_btns = st.columns([3, 1])
-                    with col_info:
-                        st.caption(f"📅 {t.start_date} → {t.end_date}  •  🏔️ {t.park_names or 'No Parks'}")
-                        if t.role != "owner":
-                            st.caption(f"Planned by **{t.owner_name}**")
-                    with col_btns:
-                        if editable:
-                            toggle_label = "Cancel" if st.session_state[edit_key] else "✏️ Edit"
-                            if st.button(toggle_label, key=f"toggle_edit_{t.id}"):
-                                st.session_state[edit_key] = not st.session_state[edit_key]
-                                st.rerun()
-                        all_notes_txt = "\n\n".join(f"=== {tp.park_name} ===\n{tp.notes}" for tp in data["trip_parks"] if tp.notes)
-                        if all_notes_txt:
-                            pdf_b = create_pdf(all_notes_txt, t.trip_name, st.session_state.user_info['firstname'])
-                            st.download_button("📥 PDF", pdf_b, f"Trip_{t.id}.pdf", key=f"dl_{t.id}")
-                        if t.role == "owner":
-                            if not st.session_state[confirm_del_key]:
-                                if st.button("🗑️ Delete", key=f"del_trip_btn_{t.id}"):
-                                    st.session_state[confirm_del_key] = True
-                                    st.rerun()
-                            else:
-                                st.warning("Delete this trip permanently?")
-                                dy, dn = st.columns(2)
-                                if dy.button("Yes, delete", key=f"confirm_del_yes_{t.id}"):
-                                    with engine.begin() as conn:
-                                        conn.execute(text("DELETE FROM trips WHERE id=:tid"), {"tid": t.id})
-                                    st.session_state[confirm_del_key] = False
-                                    invalidate_trip_data(t.id)
-                                    st.success("Trip deleted.")
-                                    st.rerun()
-                                if dn.button("Cancel", key=f"confirm_del_no_{t.id}"):
-                                    st.session_state[confirm_del_key] = False
-                                    st.rerun()
-
-                    # ── INLINE EDIT FORM ──
-                    if editable and st.session_state[edit_key]:
-                        st.divider()
-                        st.markdown("### ✏️ Edit Trip")
-                        new_name = st.text_input("Trip Name", value=t.trip_name, key=f"name_{t.id}")
-                        start = trip_start_d or date.today()
-                        end = trip_end_d or date.today()
-                        new_dates = st.date_input("Dates", value=(start, end), key=f"dates_{t.id}")
-
-                        st.markdown("**Parks**")
-                        current_park_names = [tp.park_name for tp in data["trip_parks"]]
-                        new_park_selection = st.multiselect("Select Parks", options=all_parks['name'].tolist(), default=current_park_names, key=f"parks_edit_{t.id}")
-
-                        st.markdown("**Park Notes / Itinerary**")
-                        park_notes_map = {}
-                        existing_notes = {tp.park_name: tp.notes for tp in data["trip_parks"]}
-                        for pname in new_park_selection:
-                            park_notes_map[pname] = st.text_area(f"Notes for {pname}", value=existing_notes.get(pname, ""), height=150, key=f"notes_{t.id}_{pname}")
-
-                        st.markdown("**Edit Day Activities**")
-                        edit_days = date_range_days(start, end)
-                        edit_day_acts = {d[0]: [] for d in edit_days}
-                        for a in data["acts"]:
-                            if a.day_number in edit_day_acts:
-                                edit_day_acts[a.day_number].append({"id": str(a.id), "name": a.activity_name, "type": a.activity_type or ""})
-                        render_dnd_itinerary(edit_day_acts, edit_days, editable=True)
-
-                        st.markdown("**Add a new activity:**")
-                        na1, na2, na3, na4 = st.columns([3, 2, 2, 1])
-                        new_act_name = na1.text_input("Activity name", key=f"new_act_name_{t.id}")
-                        new_act_type = na2.text_input("Type", key=f"new_act_type_{t.id}")
-                        new_act_day = na3.selectbox("Day", [d[0] for d in edit_days], key=f"new_act_day_{t.id}")
-                        if na4.button("Add", key=f"add_new_act_{t.id}") and new_act_name:
+                if data["acts"]:
+                    st.markdown("**Move or delete a saved activity:**")
+                    for sa in data["acts"]:
+                        sa1, sa2, sa3, sa4 = st.columns([3, 2, 1, 1])
+                        sa1.write(f"Day {sa.day_number} — {sa.activity_name}")
+                        move_day = sa2.selectbox("Move to", [d[0] for d in edit_days], key=f"mv_day_{sa.id}", index=sa.day_number - 1)
+                        if sa3.button("Move", key=f"mv_btn_{sa.id}"):
                             with engine.begin() as conn2:
-                                max_order = conn2.execute(text("SELECT COALESCE(MAX(sort_order),0) FROM trip_activities WHERE trip_id=:tid AND day_number=:day"),
-                                                          {"tid": t.id, "day": new_act_day}).scalar()
-                                conn2.execute(text("INSERT INTO trip_activities (trip_id, day_number, activity_name, activity_type, sort_order) VALUES (:tid,:day,:name,:atype,:order)"),
-                                              {"tid": t.id, "day": new_act_day, "name": new_act_name, "atype": new_act_type, "order": max_order+1})
+                                conn2.execute(text("UPDATE trip_activities SET day_number=:day WHERE id=:aid"), {"day": move_day, "aid": sa.id})
+                            invalidate_trip_data(t.id)
+                            st.rerun()
+                        if sa4.button("🗑️", key=f"del_act_{sa.id}"):
+                            with engine.begin() as conn2:
+                                conn2.execute(text("DELETE FROM trip_activities WHERE id=:aid"), {"aid": sa.id})
                             invalidate_trip_data(t.id)
                             st.rerun()
 
-                        if data["acts"]:
-                            st.markdown("**Move or delete a saved activity:**")
-                            for sa in data["acts"]:
-                                sa1, sa2, sa3, sa4 = st.columns([3, 2, 1, 1])
-                                sa1.write(f"Day {sa.day_number} — {sa.activity_name}")
-                                move_day = sa2.selectbox("Move to", [d[0] for d in edit_days], key=f"mv_day_{sa.id}", index=sa.day_number - 1)
-                                if sa3.button("Move", key=f"mv_btn_{sa.id}"):
-                                    with engine.begin() as conn2:
-                                        conn2.execute(text("UPDATE trip_activities SET day_number=:day WHERE id=:aid"), {"day": move_day, "aid": sa.id})
-                                    invalidate_trip_data(t.id)
-                                    st.rerun()
-                                if sa4.button("🗑️", key=f"del_act_{sa.id}"):
-                                    with engine.begin() as conn2:
-                                        conn2.execute(text("DELETE FROM trip_activities WHERE id=:aid"), {"aid": sa.id})
-                                    invalidate_trip_data(t.id)
-                                    st.rerun()
-
-                        if t.role == "owner":
-                            st.markdown("**Manage Participant Permissions**")
-                            for p in data["participants"]:
-                                if p.role == "owner":
-                                    continue
-                                pc1, pc2, pc3 = st.columns([2, 2, 1])
-                                pc1.write(f"**{p.firstname}** (@{p.username})")
-                                pc1.caption(f"Status: {p.invitation_status}")
-                                new_role = pc2.selectbox("Role", ["collaborator", "viewer"], index=0 if p.role=="collaborator" else 1, key=f"role_{t.id}_{p.username}")
-                                if pc3.button("Update", key=f"update_role_{t.id}_{p.username}"):
-                                    with engine.begin() as conn2:
-                                        conn2.execute(text("""
-                                            UPDATE trip_participants SET role=:r WHERE trip_id=:tid
-                                              AND user_id=(SELECT id FROM users WHERE username=:un)
-                                        """), {"r": new_role, "tid": t.id, "un": p.username})
-                                    invalidate_trip_data(t.id)
-                                    st.rerun()
-
-                        if st.button("💾 Save Changes", key=f"save_{t.id}"):
-                            if not new_park_selection:
-                                st.error("Please select at least one park.")
-                            else:
-                                try:
-                                    park_id_map = dict(zip(all_parks['name'], all_parks['id']))
-                                    with engine.begin() as conn2:
-                                        conn2.execute(text("UPDATE trips SET trip_name=:name, start_date=:s, end_date=:e WHERE id=:tid"),
-                                                      {"name": new_name, "s": new_dates[0] if len(new_dates)>1 else start, "e": new_dates[1] if len(new_dates)>1 else end, "tid": t.id})
-                                        removed_parks = [tp for tp in data["trip_parks"] if tp.park_name not in new_park_selection]
-                                        for rp in removed_parks:
-                                            conn2.execute(text("DELETE FROM trip_parks WHERE id=:tpkid"), {"tpkid": rp.trip_park_id})
-                                        existing_park_names = {tp.park_name: tp.trip_park_id for tp in data["trip_parks"]}
-                                        for pname in new_park_selection:
-                                            pid = park_id_map.get(pname)
-                                            if pid is None:
-                                                continue
-                                            pid = int(pid)
-                                            notes = park_notes_map.get(pname, "")
-                                            if pname in existing_park_names:
-                                                conn2.execute(text("UPDATE trip_parks SET park_id=:p, notes=:n WHERE id=:tpkid"),
-                                                              {"p": pid, "n": notes, "tpkid": existing_park_names[pname]})
-                                            else:
-                                                conn2.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t,:p,:n)"),
-                                                              {"t": t.id, "p": pid, "n": notes})
-                                    st.success("Trip updated! ✅")
-                                    st.session_state[edit_key] = False
-                                    invalidate_trip_data(t.id)
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Error saving: {e}")
-
-                    # ── READ-ONLY VIEW ──
-                    else:
-                        saved_acts = data["acts"]
-                        all_notes_rows = data["notes"]
-                        notes_by_day = {}
-                        for n in all_notes_rows:
-                            notes_by_day.setdefault(n.day_number, []).append(n)
-                        day_act_map = {}
-                        for a in saved_acts:
-                            day_act_map.setdefault(a.day_number, []).append(a)
-
-                        if data["alerts"]:
-                            st.divider()
-                            with st.expander(f"🚨 {len(data['alerts'])} active NPS alert(s) for this trip", expanded=False):
-                                for al in data["alerts"]:
-                                    st.warning(f"**{al.park_name} — {al.category}:** {al.title}")
-                                    if al.description:
-                                        st.caption(al.description[:300])
-
-                        view_days = date_range_days(t.start_date, t.end_date)
-                        st.divider()
-                        st.markdown("**📅 Day-by-Day:**")
-                        for day_num, day_date in view_days:
-                            acts = day_act_map.get(day_num, [])
-                            day_notes = notes_by_day.get(day_num, [])
-                            with st.container(border=True):
-                                st.markdown(f"**Day {day_num} — {day_date.strftime('%a, %b %d')}**")
-                                if acts:
-                                    for a in acts:
-                                        st.caption(f"  • {a.activity_name} _{a.activity_type}_")
-                                else:
-                                    st.caption("  _(no activities planned)_")
-                                if day_notes:
-                                    st.markdown("📝 **Notes:**")
-                                    for note in day_notes:
-                                        is_mine = note.author_id == current_uid
-                                        note_col1, note_col2 = st.columns([8, 1])
-                                        note_col1.markdown(
-                                            f"> {note.note_text}  \n"
-                                            f"<small>— {note.firstname} {note.lastname}, "
-                                            f"{note.created_at.strftime('%b %d') if hasattr(note.created_at,'strftime') else note.created_at}</small>",
-                                            unsafe_allow_html=True
-                                        )
-                                        if is_mine:
-                                            if note_col2.button("🗑️", key=f"del_note_{note.id}"):
-                                                with engine.begin() as conn2:
-                                                    conn2.execute(text("DELETE FROM trip_day_notes WHERE id=:nid"), {"nid": note.id})
-                                                invalidate_trip_data(t.id)
-                                                st.rerun()
-                                new_note = st.text_input(
-                                    f"Add a note for Day {day_num}",
-                                    placeholder="How did it go? Any tips for future visitors?",
-                                    key=f"note_input_{t.id}_{day_num}",
-                                    label_visibility="collapsed"
-                                )
-                                if st.button("💬 Add Note", key=f"add_note_{t.id}_{day_num}"):
-                                    if new_note.strip():
-                                        with engine.begin() as conn2:
-                                            conn2.execute(text("INSERT INTO trip_day_notes (trip_id, day_number, author_id, note_text) VALUES (:tid,:day,:uid,:note)"),
-                                                          {"tid": t.id, "day": day_num, "uid": current_uid, "note": new_note.strip()})
-                                        invalidate_trip_data(t.id)
-                                        mark_badges_dirty()
-                                        st.rerun()
-
-                        packing_rows = data["packing"]
-                        st.divider()
-                        if packing_rows:
-                            with st.expander("🎒 Packing List", expanded=False):
-                                checked_count = sum(1 for p in packing_rows if p.is_checked)
-                                total_count = len(packing_rows)
-                                st.progress(checked_count / total_count if total_count else 0,
-                                            text=f"{checked_count}/{total_count} items packed")
-                                st.caption("Check items off as you pack!")
-                                categories = {}
-                                for row in packing_rows:
-                                    categories.setdefault(row.category, []).append(row)
-                                pack_cols = st.columns(2)
-                                for ci, (category, items) in enumerate(sorted(categories.items())):
-                                    with pack_cols[ci % 2]:
-                                        st.markdown(f"**{category}**")
-                                        for item in items:
-                                            checked = st.checkbox(item.item_name, value=item.is_checked, key=f"pack_{item.id}")
-                                            if checked != item.is_checked:
-                                                with engine.begin() as conn2:
-                                                    conn2.execute(text("UPDATE trip_packing_items SET is_checked=:c WHERE id=:iid"), {"c": checked, "iid": item.id})
-                                                invalidate_trip_data(t.id)
-                                                mark_badges_dirty()
-                                                st.rerun()
-                        else:
-                            with st.expander("🎒 Packing List", expanded=False):
-                                st.caption("No packing list yet for this trip.")
-                                pl_park_names = [tp.park_name for tp in data["trip_parks"]]
-                                pl_act_types = [a.activity_type for a in saved_acts]
-                                num_days_pl = (trip_end_d - trip_start_d).days + 1 if trip_end_d and trip_start_d else 1
-                                if st.button("✨ Generate Packing List", key=f"gen_pack_{t.id}"):
-                                    with st.spinner("Packing your bags..."):
-                                        new_items = generate_packing_list(pl_park_names, pl_act_types, num_days_pl)
-                                    if new_items:
-                                        with engine.begin() as conn2:
-                                            for item in new_items:
-                                                conn2.execute(text("INSERT INTO trip_packing_items (trip_id, category, item_name) VALUES (:tid,:cat,:item)"),
-                                                              {"tid": t.id, "cat": item.get("category", "General"), "item": item.get("item", "")})
-                                        invalidate_trip_data(t.id)
-                                        st.rerun()
-                                    else:
-                                        st.error("Couldn't generate packing list. Try again.")
-
-                        if trip_end_d and trip_end_d < date.today():
-                            st.divider()
-                            st.markdown("**✍️ Trip Recap**")
-                            if t.recap_text:
-                                st.markdown(t.recap_text)
-                                if editable and st.button("🔄 Regenerate Recap", key=f"regen_recap_{t.id}"):
-                                    st.session_state[f"gen_recap_{t.id}"] = True
-                                    st.rerun()
-                            else:
-                                st.caption("This trip is in the past — generate a recap narrative!")
-                            gen_key = f"gen_recap_{t.id}"
-                            if st.session_state.get(gen_key) or not t.recap_text:
-                                if st.button("🤖 Generate AI Recap", key=f"do_recap_{t.id}"):
-                                    with st.spinner("Writing your story..."):
-                                        recap_acts = [{"day": a.day_number, "name": a.activity_name} for a in saved_acts]
-                                        recap_notes = [{"day": n.day_number, "text": n.note_text} for n in all_notes_rows]
-                                        park_names_list = [p.strip() for p in (t.park_names or "").split(",") if p.strip()]
-                                        recap = generate_trip_recap(t.trip_name, park_names_list, recap_acts, recap_notes, trip_start_d, trip_end_d)
-                                    if recap:
-                                        with engine.begin() as conn2:
-                                            conn2.execute(text("UPDATE trips SET recap_text=:r WHERE id=:tid"), {"r": recap, "tid": t.id})
-                                        st.session_state[gen_key] = False
-                                        st.rerun()
-                                    else:
-                                        st.error("Couldn't generate recap. Try again.")
-
-                        if data["trip_parks"]:
-                            st.divider()
-                            for tp in data["trip_parks"]:
-                                if tp.notes:
-                                    st.markdown(f"**📍 {tp.park_name}**")
-                                    st.markdown(tp.notes)
-
-                    # Trip crew — always visible, from cached data (no extra query)
-                    if data["participants"]:
-                        st.divider()
-                        st.markdown("**Trip Crew:**")
-                        for p in data["participants"]:
-                            status_icon = "✅" if p.invitation_status=="accepted" else "⏳" if p.invitation_status=="pending" else "❌"
-                            role_icon = "👑" if p.role=="owner" else "✏️" if p.role=="collaborator" else "👁️"
-                            st.caption(f"{status_icon} {p.firstname} {p.lastname} (@{p.username}) — {role_icon} {p.role}")
-
-                    if data["crowd"] or data["warnings"]:
-                        st.divider()
-                        crowd_icon = {"Low": "🟢", "Moderate": "🟡", "High": "🟠", "Very High": "🔴"}
-                        if data["crowd"]:
-                            with st.expander(f"📅 Crowd Forecast for your travel month", expanded=False):
-                                for cr in data["crowd"]:
-                                    icon = crowd_icon.get(cr.crowd_level, "⚪")
-                                    st.markdown(f"**{cr.park_name}** — {icon} {cr.crowd_level}")
-                                    if cr.notes:
-                                        st.caption(cr.notes)
-                        if data["warnings"]:
-                            warn_icons = {"Closure": "🚫", "Snow": "❄️", "Heat": "🌡️",
-                                          "Flooding": "🌊", "Wildlife": "🐻", "Smoke": "💨", "Lightning": "⚡"}
-                            with st.expander(f"⚠️ {len(data['warnings'])} seasonal warning(s) for this month", expanded=False):
-                                for wr in data["warnings"]:
-                                    wi = warn_icons.get(wr.warning_type, "⚠️")
-                                    st.warning(f"**{wr.park_name}** — {wi} {wr.warning_type}: {wr.description}")
-
-                    # ── EXPENSE TRACKER ─────────────────────────────────────
-                    st.divider()
-                    with st.expander("💰 Expense Tracker", expanded=False):
-                        expenses = data["expenses"]
-                        if expenses:
-                            total = sum(e.amount for e in expenses)
-                            cat_totals = {}
-                            for e in expenses:
-                                cat_totals[e.category] = cat_totals.get(e.category, 0) + e.amount
-                            st.metric("Total Trip Cost", f"${total:,.2f}")
-                            st.caption(" · ".join(f"{cat}: ${amt:,.2f}" for cat, amt in sorted(cat_totals.items())))
-                            st.divider()
-                            exp_days = {}
-                            for e in expenses:
-                                exp_days.setdefault(e.day_number or 0, []).append(e)
-                            for day_n, day_exps in sorted(exp_days.items()):
-                                elabel = f"Day {day_n}" if day_n else "General"
-                                st.markdown(f"**{elabel}**")
-                                for e in day_exps:
-                                    ec1, ec2, ec3 = st.columns([4, 2, 1])
-                                    ec1.caption(f"{e.category}: {e.description or '—'}")
-                                    ec2.caption(f"${e.amount:,.2f}" + (f" · {e.paid_by_name}" if e.paid_by_name else ""))
-                                    if editable and ec3.button("✕", key=f"del_exp_{e.id}"):
-                                        with engine.begin() as conn2:
-                                            conn2.execute(text("DELETE FROM trip_expenses WHERE id=:id"), {"id": e.id})
-                                        invalidate_trip_data(t.id)
-                                        st.rerun()
-
-                        if editable:
-                            st.divider()
-                            st.caption("**Add expense:**")
-                            view_days_exp = date_range_days(t.start_date, t.end_date)
-                            with st.form(f"add_expense_form_{t.id}"):
-                                ea1, ea2, ea3, ea4 = st.columns([2, 2, 2, 2])
-                                exp_cat = ea1.selectbox("Category", ["Food", "Gas", "Lodging", "Fees", "Gear", "Other"])
-                                exp_desc = ea2.text_input("Description")
-                                exp_amt = ea3.number_input("Amount ($)", min_value=0.0, step=0.01, format="%.2f")
-                                exp_day = ea4.selectbox("Day", [0] + [d[0] for d in view_days_exp],
-                                                         format_func=lambda d: "General" if d == 0 else f"Day {d}")
-                                add_exp = st.form_submit_button("Add")
-                            if add_exp and exp_amt > 0:
-                                with engine.begin() as conn2:
-                                    conn2.execute(text("""
-                                        INSERT INTO trip_expenses (trip_id, day_number, category, description, amount, paid_by)
-                                        VALUES (:tid, :day, :cat, :desc, :amt, :uid)
-                                    """), {"tid": t.id, "day": exp_day if exp_day else None,
-                                           "cat": exp_cat, "desc": exp_desc, "amt": exp_amt, "uid": current_uid})
-                                invalidate_trip_data(t.id)
-                                st.rerun()
-
-                    # ── PERMIT TRACKER ───────────────────────────────────────
-                    with st.expander("🎫 Permit Tracker", expanded=False):
-                        permits = data["permits"]
-                        if permits:
-                            for pm in permits:
-                                pm1, pm2, pm3 = st.columns([5, 2, 1])
-                                secured_icon = "✅" if pm.secured else "⏳"
-                                due = f" · due {pm.required_by}" if pm.required_by else ""
-                                pm1.markdown(f"{secured_icon} **{pm.permit_name}** — _{pm.park_name or 'General'}_{due}")
-                                if pm.notes:
-                                    pm1.caption(pm.notes)
-                                if pm2.button("✅ Mark Secured" if not pm.secured else "↩️ Mark Pending",
-                                              key=f"toggle_permit_{pm.id}"):
-                                    with engine.begin() as conn2:
-                                        conn2.execute(text("UPDATE trip_permits SET secured=:s WHERE id=:id"),
-                                                      {"s": not pm.secured, "id": pm.id})
-                                    invalidate_trip_data(t.id)
-                                    st.rerun()
-                                if editable and pm3.button("✕", key=f"del_permit_{pm.id}"):
-                                    with engine.begin() as conn2:
-                                        conn2.execute(text("DELETE FROM trip_permits WHERE id=:id"), {"id": pm.id})
-                                    invalidate_trip_data(t.id)
-                                    st.rerun()
-                        elif not editable:
-                            st.caption("No permits tracked for this trip.")
-
-                        if editable:
-                            st.divider()
-                            st.caption("**Add permit:**")
-                            perm_park_opts = {tp_r.park_name: tp_r.park_id for tp_r in data["trip_parks"]}
-                            with st.form(f"add_permit_form_{t.id}"):
-                                pa1, pa2, pa3 = st.columns([3, 2, 2])
-                                perm_name = pa1.text_input("Permit name")
-                                perm_park = pa2.selectbox("Park", ["General"] + list(perm_park_opts.keys()))
-                                perm_due = pa3.date_input("Required by", value=None)
-                                add_perm = st.form_submit_button("Add")
-                            if add_perm and perm_name:
-                                with engine.begin() as conn2:
-                                    conn2.execute(text("""
-                                        INSERT INTO trip_permits (trip_id, park_id, permit_name, required_by)
-                                        VALUES (:tid, :pid, :name, :due)
-                                    """), {"tid": t.id,
-                                           "pid": perm_park_opts.get(perm_park) if perm_park != "General" else None,
-                                           "name": perm_name, "due": perm_due if perm_due else None})
-                                invalidate_trip_data(t.id)
-                                st.rerun()
-
-                    # ── RATING & REVIEW (past trips) ─────────────────────────
-                    if trip_end_d and trip_end_d < date.today() and editable:
-                        st.divider()
-                        st.markdown("**⭐ Rate & Review This Trip**")
-                        current_rating = t.rating or 0
-                        with st.form(f"rating_form_{t.id}"):
-                            new_rating = st.select_slider(
-                                "Rating", options=[1, 2, 3, 4, 5],
-                                value=current_rating if current_rating > 0 else 3,
-                                format_func=lambda x: "⭐" * x,
-                            )
-                            new_review = st.text_area("Write a review (optional)",
-                                                       value=t.review_text or "",
-                                                       placeholder="What made this trip memorable? Tips for others?",
-                                                       height=100)
-                            is_public_now = st.checkbox("🌐 Make this trip public in the community feed",
-                                                         value=bool(t.is_public))
-                            save_rating = st.form_submit_button("💾 Save Rating & Review")
-                        if save_rating:
+                if t.role == "owner":
+                    st.markdown("**Manage Participant Permissions**")
+                    for p in data["participants"]:
+                        if p.role == "owner":
+                            continue
+                        pc1, pc2, pc3 = st.columns([2, 2, 1])
+                        pc1.write(f"**{p.firstname}** (@{p.username})")
+                        pc1.caption(f"Status: {p.invitation_status}")
+                        new_role = pc2.selectbox("Role", ["collaborator", "viewer"], index=0 if p.role == "collaborator" else 1, key=f"role_{t.id}_{p.username}")
+                        if pc3.button("Update", key=f"update_role_{t.id}_{p.username}"):
                             with engine.begin() as conn2:
                                 conn2.execute(text("""
-                                    UPDATE trips SET rating=:r, review_text=:rv, is_public=:pub WHERE id=:tid
-                                """), {"r": new_rating, "rv": new_review.strip() or None,
-                                       "pub": is_public_now, "tid": t.id})
-                            st.success("Saved! ⭐")
+                                    UPDATE trip_participants SET role=:r WHERE trip_id=:tid
+                                      AND user_id=(SELECT id FROM users WHERE username=:un)
+                                """), {"r": new_role, "tid": t.id, "un": p.username})
+                            invalidate_trip_data(t.id)
                             st.rerun()
 
-    # ─────────────────────────────────────────────
-    # PASSPORT TAB — park grid (map removed)
-    # ─────────────────────────────────────────────
-    with passport_tab:
-        st.header("🗺 National Park Passport")
-        st.caption("Track every park you've visited across the US.")
-
-        with engine.connect() as conn2:
-            visited_rows = conn2.execute(text("""
-                SELECT DISTINCT p.id, p.name, p.state, p.image_url
-                FROM parks p
-                JOIN trip_parks tpk ON p.id=tpk.park_id
-                JOIN trips t ON tpk.trip_id=t.id
-                JOIN trip_participants tp ON t.id=tp.trip_id
-                WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
-                ORDER BY p.state, p.name
-            """), {"uid": current_uid}).fetchall()
-
-        all_parks_pass_df = get_park_name_id_df()  # cached
-        visited_ids = {r.id for r in visited_rows}
-        visited_states = list({r.state for r in visited_rows if r.state})
-
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Parks Visited", len(visited_ids))
-        s2.metric("States Explored", len(visited_states))
-        s3.metric("Total Parks", len(all_parks_pass_df))
-        total_parks_n = max(len(all_parks_pass_df), 1)
-        st.progress(len(visited_ids) / total_parks_n,
-                    text=f"{len(visited_ids)} / {len(all_parks_pass_df)} parks ({len(visited_ids)/total_parks_n*100:.0f}%)")
-
-        if visited_states:
-            st.caption("📍 States explored: " + ", ".join(sorted(visited_states)))
-
-        st.divider()
-
-        tab_vis, tab_unvis = st.tabs([f"✅ Visited ({len(visited_ids)})", f"🔲 Not Yet ({len(all_parks_pass_df)-len(visited_ids)})"])
-        with tab_vis:
-            if not visited_rows:
-                st.info("No parks visited yet — plan your first trip!")
-            else:
-                for i in range(0, len(visited_rows), 4):
-                    cols = st.columns(4)
-                    for col, row in zip(cols, visited_rows[i:i+4]):
-                        with col:
-                            with st.container(border=True):
-                                if row.image_url:
-                                    st.image(row.image_url, use_container_width=True)
-                                st.caption(f"✅ **{row.name}**")
-                                st.caption(f"📍 {row.state}")
-        with tab_unvis:
-            unvisited = all_parks_pass_df[~all_parks_pass_df['id'].isin(visited_ids)]
-            unvisited_records = unvisited.to_dict('records')
-            for i in range(0, len(unvisited_records), 4):
-                cols = st.columns(4)
-                for col, row in zip(cols, unvisited_records[i:i+4]):
-                    with col:
-                        st.caption(f"🔲 **{row['name']}**  \n📍 {row['state']}")
-
-    # ─────────────────────────────────────────────
-    # DISCOVER TAB
-    # ─────────────────────────────────────────────
-    with discover_tab:
-        st.header("🌍 Discover")
-        disc_tab1, disc_tab2, disc_tab3, disc_tab4 = st.tabs([
-            "🌐 Public Trips", "👥 Friend Activity", "💡 Recommended Parks", "🏆 Challenges"
-        ])
-
-        with disc_tab1:
-            st.subheader("🌐 Community Trip Feed")
-            st.caption("Trips marked public by the community. Get inspired!")
-
-            with engine.connect() as conn2:
-                pub_trips = conn2.execute(text("""
-                    SELECT t.id, t.trip_name, t.start_date, t.end_date,
-                           t.rating, t.review_text,
-                           u.firstname, u.lastname, u.username,
-                           STRING_AGG(DISTINCT p.name, ', ' ORDER BY p.name) AS park_names,
-                           STRING_AGG(DISTINCT p.image_url, '|' ORDER BY p.image_url) AS park_images
-                    FROM trips t
-                    JOIN users u ON t.owner_id=u.id
-                    LEFT JOIN trip_parks tpk ON t.id=tpk.trip_id
-                    LEFT JOIN parks p ON tpk.park_id=p.id
-                    WHERE t.is_public=TRUE AND t.owner_id!=:uid
-                      AND (t.is_template IS NULL OR t.is_template=FALSE)
-                    GROUP BY t.id, t.trip_name, t.start_date, t.end_date,
-                             t.rating, t.review_text, u.firstname, u.lastname, u.username
-                    ORDER BY t.end_date DESC NULLS LAST
-                    LIMIT 30
-                """), {"uid": current_uid}).fetchall()
-
-            if not pub_trips:
-                st.info("No public trips yet. Be the first — mark one of your completed trips as public in My Trips!")
-            else:
-                for pt in pub_trips:
-                    with st.container(border=True):
-                        imgs = [i for i in (pt.park_images or "").split("|") if i]
-                        if imgs:
-                            st.image(imgs[0], use_container_width=True)
-                        stars = "⭐" * (pt.rating or 0)
-                        st.markdown(f"**{pt.trip_name}** {stars}")
-                        st.caption(f"👤 {pt.firstname} {pt.lastname} (@{pt.username})  •  📅 {pt.start_date} → {pt.end_date}")
-                        st.caption(f"🏔️ {pt.park_names or 'Parks not listed'}")
-                        if pt.review_text:
-                            st.markdown(f"> {pt.review_text}")
-                        if st.button("✨ Use as Inspiration", key=f"inspire_{pt.id}"):
-                            with engine.connect() as conn2:
-                                inspire_parks = conn2.execute(text("""
-                                    SELECT p.name FROM trip_parks tpk
-                                    JOIN parks p ON tpk.park_id=p.id WHERE tpk.trip_id=:tid
-                                """), {"tid": pt.id}).fetchall()
-                            st.session_state["selected_parks"] = [r.name for r in inspire_parks]
-                            st.session_state.active_parks_saved = [r.name for r in inspire_parks]
-                            st.success("Parks loaded! Switch to Plan Trip to continue.")
-
-        with disc_tab2:
-            st.subheader("👥 Friend Activity")
-            with engine.connect() as conn2:
-                friend_activity = conn2.execute(text("""
-                    SELECT t.id, t.trip_name, t.start_date, t.end_date,
-                           u.firstname, u.lastname,
-                           STRING_AGG(DISTINCT p.name, ', ' ORDER BY p.name) AS park_names,
-                           STRING_AGG(DISTINCT p.image_url, '|' ORDER BY p.image_url) AS park_images,
-                           tp_owner.role,
-                           t.rating
-                    FROM trips t
-                    JOIN trip_participants tp_owner ON t.id=tp_owner.trip_id AND tp_owner.role='owner'
-                    JOIN users u ON tp_owner.user_id=u.id
-                    LEFT JOIN trip_parks tpk ON t.id=tpk.trip_id
-                    LEFT JOIN parks p ON tpk.park_id=p.id
-                    WHERE tp_owner.user_id IN (
-                        SELECT CASE WHEN f.user_id=:uid THEN f.friend_id ELSE f.user_id END
-                        FROM friendships f WHERE (f.user_id=:uid OR f.friend_id=:uid) AND f.status='accepted'
-                    )
-                    AND (t.is_template IS NULL OR t.is_template=FALSE)
-                    AND tp_owner.invitation_status='accepted'
-                    GROUP BY t.id, t.trip_name, t.start_date, t.end_date,
-                             u.firstname, u.lastname, tp_owner.role, t.rating
-                    ORDER BY t.start_date DESC NULLS LAST
-                    LIMIT 20
-                """), {"uid": current_uid}).fetchall()
-
-            if not friend_activity:
-                st.info("Add friends to see their trips here!")
-            else:
-                for fa in friend_activity:
-                    with st.container(border=True):
-                        imgs = [i for i in (fa.park_images or "").split("|") if i]
-                        if imgs:
-                            st.image(imgs[0], use_container_width=True)
-                        status_e, status_l, _ = trip_status(fa.start_date, fa.end_date)
-                        stars = "⭐" * (fa.rating or 0)
-                        st.markdown(f"**{fa.trip_name}** {stars}  {status_e} _{status_l}_")
-                        st.caption(f"👤 {fa.firstname} {fa.lastname}  •  🏔️ {fa.park_names or '—'}")
-                        st.caption(f"📅 {fa.start_date} → {fa.end_date}")
-
-        with disc_tab3:
-            st.subheader("💡 Parks You Might Love")
-            st.caption("Based on the parks you've already visited.")
-
-            with engine.connect() as conn2:
-                visited_park_ids_rec = [r[0] for r in conn2.execute(text("""
-                    SELECT DISTINCT tpk.park_id FROM trip_parks tpk
-                    JOIN trips t ON tpk.trip_id=t.id
-                    JOIN trip_participants tp ON t.id=tp.trip_id
-                    WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
-                """), {"uid": current_uid}).fetchall()]
-
-                visited_states_rec = [r[0] for r in conn2.execute(text("""
-                    SELECT DISTINCT p.state FROM parks p
-                    JOIN trip_parks tpk ON p.id=tpk.park_id
-                    JOIN trips t ON tpk.trip_id=t.id
-                    JOIN trip_participants tp ON t.id=tp.trip_id
-                    WHERE tp.user_id=:uid AND tp.invitation_status='accepted' AND p.state IS NOT NULL
-                """), {"uid": current_uid}).fetchall()]
-
-            if not visited_park_ids_rec:
-                st.info("Visit some parks first and we'll recommend similar ones!")
-            else:
-                with engine.connect() as conn2:
-                    if visited_states_rec:
-                        recs = conn2.execute(text("""
-                            SELECT p.id, p.name, p.state, p.image_url,
-                                   pd.description, pd.entrance_fee_cost
-                            FROM parks p
-                            LEFT JOIN park_details pd ON p.id=pd.park_id
-                            WHERE p.id NOT IN :visited
-                              AND p.state IN :states
-                            ORDER BY p.name LIMIT 9
-                        """), {"visited": tuple(visited_park_ids_rec) or (0,),
-                               "states": tuple(visited_states_rec)}).fetchall()
+                if st.button("💾 Save Changes", key=f"save_{t.id}"):
+                    if not new_park_selection:
+                        st.error("Please select at least one park.")
                     else:
-                        recs = []
+                        try:
+                            park_id_map = dict(zip(all_parks['name'], all_parks['id']))
+                            with engine.begin() as conn2:
+                                conn2.execute(text("UPDATE trips SET trip_name=:name, start_date=:s, end_date=:e WHERE id=:tid"),
+                                              {"name": new_name, "s": new_dates[0] if len(new_dates) > 1 else start,
+                                               "e": new_dates[1] if len(new_dates) > 1 else end, "tid": t.id})
+                                for rp in [tp for tp in data["trip_parks"] if tp.park_name not in new_park_selection]:
+                                    conn2.execute(text("DELETE FROM trip_parks WHERE id=:tpkid"), {"tpkid": rp.trip_park_id})
+                                existing_park_names = {tp.park_name: tp.trip_park_id for tp in data["trip_parks"]}
+                                for pname in new_park_selection:
+                                    pid = park_id_map.get(pname)
+                                    if pid is None:
+                                        continue
+                                    pid, notes = int(pid), park_notes_map.get(pname, "")
+                                    if pname in existing_park_names:
+                                        conn2.execute(text("UPDATE trip_parks SET park_id=:p, notes=:n WHERE id=:tpkid"),
+                                                      {"p": pid, "n": notes, "tpkid": existing_park_names[pname]})
+                                    else:
+                                        conn2.execute(text("INSERT INTO trip_parks (trip_id, park_id, notes) VALUES (:t,:p,:n)"),
+                                                      {"t": t.id, "p": pid, "n": notes})
+                            st.success("Trip updated! ✅")
+                            st.session_state[edit_key] = False
+                            invalidate_trip_data(t.id)
+                            get_my_trips.clear()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error saving: {e}")
+            else:
+                _render_trip_read_only(t, data, current_uid, editable, trip_start_d, trip_end_d)
 
-                    if len(recs) < 9:
-                        already = {r.id for r in recs} | set(visited_park_ids_rec)
-                        extra = conn2.execute(text("""
-                            SELECT p.id, p.name, p.state, p.image_url,
-                                   pd.description, pd.entrance_fee_cost
-                            FROM parks p
-                            LEFT JOIN park_details pd ON p.id=pd.park_id
-                            WHERE p.id NOT IN :excl
-                            ORDER BY p.name LIMIT :lim
-                        """), {"excl": tuple(already) or (0,), "lim": 9 - len(recs)}).fetchall()
-                        recs = list(recs) + list(extra)
+            if data["participants"]:
+                st.divider()
+                st.markdown("**Trip Crew:**")
+                for p in data["participants"]:
+                    status_icon = "✅" if p.invitation_status == "accepted" else "⏳" if p.invitation_status == "pending" else "❌"
+                    role_icon = "👑" if p.role == "owner" else "✏️" if p.role == "collaborator" else "👁️"
+                    st.caption(f"{status_icon} {p.firstname} {p.lastname} (@{p.username}) — {role_icon} {p.role}")
 
-                for i in range(0, len(recs), 3):
-                    cols = st.columns(3)
-                    for col, r in zip(cols, recs[i:i+3]):
-                        with col:
-                            with st.container(border=True):
-                                if r.image_url:
-                                    st.image(r.image_url, use_container_width=True)
-                                st.markdown(f"**{r.name}**")
-                                st.caption(f"📍 {r.state}")
-                                if r.description:
-                                    st.caption(str(r.description)[:150] + "...")
-                                if r.entrance_fee_cost:
-                                    st.caption(f"💵 ${r.entrance_fee_cost}")
-                                if st.button("Plan a trip here", key=f"rec_plan_{r.id}"):
-                                    st.session_state["selected_parks"] = [r.name]
-                                    st.session_state.active_parks_saved = [r.name]
-                                    st.success(f"Loaded {r.name}! Switch to Plan Trip.")
+            if data["crowd"] or data["warnings"]:
+                st.divider()
+                crowd_icon = {"Low": "🟢", "Moderate": "🟡", "High": "🟠", "Very High": "🔴"}
+                if data["crowd"]:
+                    with st.expander("📅 Crowd Forecast for your travel month", expanded=False):
+                        for cr in data["crowd"]:
+                            st.markdown(f"**{cr.park_name}** — {crowd_icon.get(cr.crowd_level, '⚪')} {cr.crowd_level}")
+                            if cr.notes:
+                                st.caption(cr.notes)
+                if data["warnings"]:
+                    warn_icons = {"Closure": "🚫", "Snow": "❄️", "Heat": "🌡️", "Flooding": "🌊", "Wildlife": "🐻", "Smoke": "💨", "Lightning": "⚡"}
+                    with st.expander(f"⚠️ {len(data['warnings'])} seasonal warning(s) for this month", expanded=False):
+                        for wr in data["warnings"]:
+                            st.warning(f"**{wr.park_name}** — {warn_icons.get(wr.warning_type, '⚠️')} {wr.warning_type}: {wr.description}")
 
-        with disc_tab4:
-            st.subheader("🏆 Bucket List Challenges")
+            st.divider()
+            with st.expander("💰 Expense Tracker", expanded=False):
+                expenses = data["expenses"]
+                if expenses:
+                    total = sum(e.amount for e in expenses)
+                    cat_totals = {}
+                    for e in expenses:
+                        cat_totals[e.category] = cat_totals.get(e.category, 0) + e.amount
+                    st.metric("Total Trip Cost", f"${total:,.2f}")
+                    st.caption(" · ".join(f"{cat}: ${amt:,.2f}" for cat, amt in sorted(cat_totals.items())))
+                    st.divider()
+                    exp_days = {}
+                    for e in expenses:
+                        exp_days.setdefault(e.day_number or 0, []).append(e)
+                    for day_n, day_exps in sorted(exp_days.items()):
+                        st.markdown(f"**{'Day ' + str(day_n) if day_n else 'General'}**")
+                        for e in day_exps:
+                            ec1, ec2, ec3 = st.columns([4, 2, 1])
+                            ec1.caption(f"{e.category}: {e.description or '—'}")
+                            ec2.caption(f"${e.amount:,.2f}" + (f" · {e.paid_by_name}" if e.paid_by_name else ""))
+                            if editable and ec3.button("✕", key=f"del_exp_{e.id}"):
+                                with engine.begin() as conn2:
+                                    conn2.execute(text("DELETE FROM trip_expenses WHERE id=:id"), {"id": e.id})
+                                invalidate_trip_data(t.id)
+                                st.rerun()
 
-            challenge_defs = get_challenge_definitions()  # cached
+                if editable:
+                    st.divider()
+                    st.caption("**Add expense:**")
+                    view_days_exp = date_range_days(t.start_date, t.end_date)
+                    with st.form(f"add_expense_form_{t.id}"):
+                        ea1, ea2, ea3, ea4 = st.columns([2, 2, 2, 2])
+                        exp_cat = ea1.selectbox("Category", ["Food", "Gas", "Lodging", "Fees", "Gear", "Other"])
+                        exp_desc = ea2.text_input("Description")
+                        exp_amt = ea3.number_input("Amount ($)", min_value=0.0, step=0.01, format="%.2f")
+                        exp_day = ea4.selectbox("Day", [0] + [d[0] for d in view_days_exp], format_func=lambda d: "General" if d == 0 else f"Day {d}")
+                        add_exp = st.form_submit_button("Add")
+                    if add_exp and exp_amt > 0:
+                        with engine.begin() as conn2:
+                            conn2.execute(text("""
+                                INSERT INTO trip_expenses (trip_id, day_number, category, description, amount, paid_by)
+                                VALUES (:tid, :day, :cat, :desc, :amt, :uid)
+                            """), {"tid": t.id, "day": exp_day or None, "cat": exp_cat, "desc": exp_desc, "amt": exp_amt, "uid": current_uid})
+                        invalidate_trip_data(t.id)
+                        st.rerun()
+
+            with st.expander("🎫 Permit Tracker", expanded=False):
+                permits = data["permits"]
+                if permits:
+                    for pm in permits:
+                        pm1, pm2, pm3 = st.columns([5, 2, 1])
+                        due = f" · due {pm.required_by}" if pm.required_by else ""
+                        pm1.markdown(f"{'✅' if pm.secured else '⏳'} **{pm.permit_name}** — _{pm.park_name or 'General'}_{due}")
+                        if pm.notes:
+                            pm1.caption(pm.notes)
+                        if pm2.button("✅ Mark Secured" if not pm.secured else "↩️ Mark Pending", key=f"toggle_permit_{pm.id}"):
+                            with engine.begin() as conn2:
+                                conn2.execute(text("UPDATE trip_permits SET secured=:s WHERE id=:id"), {"s": not pm.secured, "id": pm.id})
+                            invalidate_trip_data(t.id)
+                            st.rerun()
+                        if editable and pm3.button("✕", key=f"del_permit_{pm.id}"):
+                            with engine.begin() as conn2:
+                                conn2.execute(text("DELETE FROM trip_permits WHERE id=:id"), {"id": pm.id})
+                            invalidate_trip_data(t.id)
+                            st.rerun()
+                elif not editable:
+                    st.caption("No permits tracked for this trip.")
+
+                if editable:
+                    st.divider()
+                    st.caption("**Add permit:**")
+                    perm_park_opts = {tp_r.park_name: tp_r.park_id for tp_r in data["trip_parks"]}
+                    with st.form(f"add_permit_form_{t.id}"):
+                        pa1, pa2, pa3 = st.columns([3, 2, 2])
+                        perm_name = pa1.text_input("Permit name")
+                        perm_park = pa2.selectbox("Park", ["General"] + list(perm_park_opts.keys()))
+                        perm_due = pa3.date_input("Required by", value=None)
+                        add_perm = st.form_submit_button("Add")
+                    if add_perm and perm_name:
+                        with engine.begin() as conn2:
+                            conn2.execute(text("""
+                                INSERT INTO trip_permits (trip_id, park_id, permit_name, required_by)
+                                VALUES (:tid, :pid, :name, :due)
+                            """), {"tid": t.id, "pid": perm_park_opts.get(perm_park) if perm_park != "General" else None,
+                                   "name": perm_name, "due": perm_due or None})
+                        invalidate_trip_data(t.id)
+                        st.rerun()
+
+            if trip_end_d and trip_end_d < date.today() and editable:
+                st.divider()
+                st.markdown("**⭐ Rate & Review This Trip**")
+                current_rating = t.rating or 0
+                with st.form(f"rating_form_{t.id}"):
+                    new_rating = st.select_slider("Rating", options=[1, 2, 3, 4, 5],
+                                                   value=current_rating if current_rating > 0 else 3, format_func=lambda x: "⭐" * x)
+                    new_review = st.text_area("Write a review (optional)", value=t.review_text or "",
+                                               placeholder="What made this trip memorable? Tips for others?", height=100)
+                    is_public_now = st.checkbox("🌐 Make this trip public in the community feed", value=bool(t.is_public))
+                    save_rating = st.form_submit_button("💾 Save Rating & Review")
+                if save_rating:
+                    with engine.begin() as conn2:
+                        conn2.execute(text("UPDATE trips SET rating=:r, review_text=:rv, is_public=:pub WHERE id=:tid"),
+                                      {"r": new_rating, "rv": new_review.strip() or None, "pub": is_public_now, "tid": t.id})
+                    get_my_trips.clear(); get_public_trips.clear()
+                    st.success("Saved! ⭐")
+                    st.rerun()
+
+
+def render_passport(current_uid):
+    st.header("🗺 National Park Passport")
+    st.caption("Track every park you've visited across the US.")
+
+    visited_rows = get_passport_data(current_uid)
+    all_parks_pass_df = get_park_name_id_df()
+    visited_ids = {r.id for r in visited_rows}
+    visited_states = list({r.state for r in visited_rows if r.state})
+
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Parks Visited", len(visited_ids))
+    s2.metric("States Explored", len(visited_states))
+    s3.metric("Total Parks", len(all_parks_pass_df))
+    total_parks_n = max(len(all_parks_pass_df), 1)
+    st.progress(len(visited_ids) / total_parks_n,
+                text=f"{len(visited_ids)} / {len(all_parks_pass_df)} parks ({len(visited_ids)/total_parks_n*100:.0f}%)")
+
+    if visited_states:
+        st.caption("📍 States explored: " + ", ".join(sorted(visited_states)))
+
+    st.divider()
+    tab_vis, tab_unvis = st.tabs([f"✅ Visited ({len(visited_ids)})", f"🔲 Not Yet ({len(all_parks_pass_df)-len(visited_ids)})"])
+    with tab_vis:
+        if not visited_rows:
+            st.info("No parks visited yet — plan your first trip!")
+        else:
+            for i in range(0, len(visited_rows), 4):
+                cols = st.columns(4)
+                for col, row in zip(cols, visited_rows[i:i + 4]):
+                    with col, st.container(border=True):
+                        if row.image_url:
+                            st.image(row.image_url, use_container_width=True)
+                        st.caption(f"✅ **{row.name}**")
+                        st.caption(f"📍 {row.state}")
+    with tab_unvis:
+        unvisited = all_parks_pass_df[~all_parks_pass_df['id'].isin(visited_ids)].to_dict('records')
+        for i in range(0, len(unvisited), 4):
+            cols = st.columns(4)
+            for col, row in zip(cols, unvisited[i:i + 4]):
+                col.caption(f"🔲 **{row['name']}**  \n📍 {row['state']}")
+
+
+def render_discover(current_uid):
+    st.header("🌍 Discover")
+    disc_tab1, disc_tab2, disc_tab3, disc_tab4 = st.tabs([
+        "🌐 Public Trips", "👥 Friend Activity", "💡 Recommended Parks", "🏆 Challenges"
+    ])
+
+    with disc_tab1:
+        st.subheader("🌐 Community Trip Feed")
+        st.caption("Trips marked public by the community. Get inspired!")
+        pub_trips = get_public_trips(current_uid)
+        if not pub_trips:
+            st.info("No public trips yet. Be the first — mark one of your completed trips as public in My Trips!")
+        else:
+            for pt in pub_trips:
+                with st.container(border=True):
+                    imgs = [i for i in (pt.park_images or "").split("|") if i]
+                    if imgs:
+                        st.image(imgs[0], use_container_width=True)
+                    st.markdown(f"**{pt.trip_name}** {'⭐' * (pt.rating or 0)}")
+                    st.caption(f"👤 {pt.firstname} {pt.lastname} (@{pt.username})  •  📅 {pt.start_date} → {pt.end_date}")
+                    st.caption(f"🏔️ {pt.park_names or 'Parks not listed'}")
+                    if pt.review_text:
+                        st.markdown(f"> {pt.review_text}")
+                    if st.button("✨ Use as Inspiration", key=f"inspire_{pt.id}"):
+                        with engine.connect() as conn2:
+                            inspire_parks = conn2.execute(text("""
+                                SELECT p.name FROM trip_parks tpk JOIN parks p ON tpk.park_id=p.id WHERE tpk.trip_id=:tid
+                            """), {"tid": pt.id}).fetchall()
+                        st.session_state["selected_parks"] = [r.name for r in inspire_parks]
+                        st.session_state.active_parks_saved = [r.name for r in inspire_parks]
+                        st.success("Parks loaded! Switch to Plan Trip to continue.")
+
+    with disc_tab2:
+        st.subheader("👥 Friend Activity")
+        friend_activity = get_friend_activity(current_uid)
+        if not friend_activity:
+            st.info("Add friends to see their trips here!")
+        else:
+            for fa in friend_activity:
+                with st.container(border=True):
+                    imgs = [i for i in (fa.park_images or "").split("|") if i]
+                    if imgs:
+                        st.image(imgs[0], use_container_width=True)
+                    status_e, status_l, _ = trip_status(fa.start_date, fa.end_date)
+                    st.markdown(f"**{fa.trip_name}** {'⭐' * (fa.rating or 0)}  {status_e} _{status_l}_")
+                    st.caption(f"👤 {fa.firstname} {fa.lastname}  •  🏔️ {fa.park_names or '—'}")
+                    st.caption(f"📅 {fa.start_date} → {fa.end_date}")
+
+    with disc_tab3:
+        st.subheader("💡 Parks You Might Love")
+        st.caption("Based on the parks you've already visited.")
+        recs = get_recommended_parks(current_uid)
+        if not recs:
+            st.info("Visit some parks first and we'll recommend similar ones!")
+        else:
+            for i in range(0, len(recs), 3):
+                cols = st.columns(3)
+                for col, r in zip(cols, recs[i:i + 3]):
+                    with col, st.container(border=True):
+                        if r.image_url:
+                            st.image(r.image_url, use_container_width=True)
+                        st.markdown(f"**{r.name}**")
+                        st.caption(f"📍 {r.state}")
+                        if r.description:
+                            st.caption(str(r.description)[:150] + "...")
+                        if r.entrance_fee_cost:
+                            st.caption(f"💵 ${r.entrance_fee_cost}")
+                        if st.button("Plan a trip here", key=f"rec_plan_{r.id}"):
+                            st.session_state["selected_parks"] = [r.name]
+                            st.session_state.active_parks_saved = [r.name]
+                            st.success(f"Loaded {r.name}! Switch to Plan Trip.")
+
+    with disc_tab4:
+        st.subheader("🏆 Bucket List Challenges")
+        challenge_defs = get_challenge_definitions()
+
+        # Computed once per session (like badges) instead of on every rerun.
+        if not st.session_state.challenges_checked_session:
             with engine.connect() as conn2:
-                progress_rows = conn2.execute(text("""
-                    SELECT challenge_id, completed, completed_at
-                    FROM user_challenge_progress WHERE user_id=:uid
-                """), {"uid": current_uid}).fetchall()
+                progress_rows = conn2.execute(text(
+                    "SELECT challenge_id, completed, completed_at FROM user_challenge_progress WHERE user_id=:uid"
+                ), {"uid": current_uid}).fetchall()
                 user_visited_ids = set(r[0] for r in conn2.execute(text("""
                     SELECT DISTINCT tpk.park_id FROM trip_parks tpk
-                    JOIN trips t ON tpk.trip_id=t.id
-                    JOIN trip_participants tp ON t.id=tp.trip_id
+                    JOIN trips t ON tpk.trip_id=t.id JOIN trip_participants tp ON t.id=tp.trip_id
                     WHERE tp.user_id=:uid AND tp.invitation_status='accepted'
                 """), {"uid": current_uid}).fetchall())
                 user_visited_states = set(r[0] for r in conn2.execute(text("""
                     SELECT DISTINCT p.state FROM parks p
-                    JOIN trip_parks tpk ON p.id=tpk.park_id
-                    JOIN trips t ON tpk.trip_id=t.id
+                    JOIN trip_parks tpk ON p.id=tpk.park_id JOIN trips t ON tpk.trip_id=t.id
                     JOIN trip_participants tp ON t.id=tp.trip_id
                     WHERE tp.user_id=:uid AND tp.invitation_status='accepted' AND p.state IS NOT NULL
                 """), {"uid": current_uid}).fetchall())
 
             progress_map = {r.challenge_id: r for r in progress_rows}
 
-            def check_challenge_progress(c):
+            def check_progress(c):
                 if c.required_park_ids:
-                    done = sum(1 for pid in c.required_park_ids if pid in user_visited_ids)
-                    return done, len(c.required_park_ids)
+                    return sum(1 for pid in c.required_park_ids if pid in user_visited_ids), len(c.required_park_ids)
                 if c.required_states and c.required_count:
-                    done = sum(1 for s in c.required_states if s in user_visited_states)
-                    return done, c.required_count
+                    return sum(1 for s in c.required_states if s in user_visited_states), c.required_count
                 if c.required_count:
                     return min(len(user_visited_ids), c.required_count), c.required_count
                 return 0, 1
 
-            newly_completed = []
-            all_challenges = []
+            newly_completed, all_challenges = [], []
             for c in challenge_defs:
                 prog = progress_map.get(c.id)
                 completed = bool(prog.completed) if prog else False
                 completed_at = prog.completed_at if prog else None
-                done, total = check_challenge_progress(c)
+                done, total = check_progress(c)
                 if done >= total and not completed:
                     with engine.begin() as conn2:
                         conn2.execute(text("""
                             INSERT INTO user_challenge_progress (user_id, challenge_id, completed, completed_at)
                             VALUES (:uid, :cid, TRUE, NOW())
-                            ON CONFLICT (user_id, challenge_id) DO UPDATE
-                              SET completed=TRUE, completed_at=NOW()
+                            ON CONFLICT (user_id, challenge_id) DO UPDATE SET completed=TRUE, completed_at=NOW()
                         """), {"uid": current_uid, "cid": c.id})
                     completed = True
                     newly_completed.append(c)
-                all_challenges.append((c, completed, completed_at))
+                all_challenges.append((c.id, c.icon, c.name, c.description, completed, completed_at,
+                                        check_progress(c)[0], check_progress(c)[1]))
 
+            st.session_state["challenges_cache"] = all_challenges
+            st.session_state.challenges_checked_session = True
             for c in newly_completed:
                 st.toast(f"🏆 Challenge complete: {c.icon} {c.name}!", icon="🎉")
 
-            completed_chall = [(c, ca) for c, comp, ca in all_challenges if comp]
-            in_progress = [c for c, comp, ca in all_challenges if not comp]
+        all_challenges = st.session_state.get("challenges_cache", [])
+        completed_chall = [(icon, name, desc, ca) for _, icon, name, desc, comp, ca, d, t2 in all_challenges if comp]
+        in_progress = [(icon, name, desc, d, t2) for _, icon, name, desc, comp, ca, d, t2 in all_challenges if not comp]
 
-            st.caption(f"**{len(completed_chall)}/{len(all_challenges)}** challenges completed")
-            st.progress(len(completed_chall) / max(len(all_challenges), 1))
+        st.caption(f"**{len(completed_chall)}/{len(all_challenges)}** challenges completed")
+        st.progress(len(completed_chall) / max(len(all_challenges), 1))
 
-            st.markdown("**In Progress:**")
-            for c in in_progress:
-                done, total = check_challenge_progress(c)
+        st.markdown("**In Progress:**")
+        for icon, name, desc, done, total in in_progress:
+            with st.container(border=True):
+                c1, c2 = st.columns([3, 1])
+                c1.markdown(f"{icon} **{name}**")
+                c1.caption(desc)
+                c2.metric("Progress", f"{done}/{total}")
+                st.progress(done / max(total, 1))
+
+        if completed_chall:
+            st.markdown("**Completed 🎉:**")
+            for icon, name, desc, completed_at in completed_chall:
+                ts = completed_at.strftime("%b %d, %Y") if completed_at and hasattr(completed_at, 'strftime') else ""
                 with st.container(border=True):
-                    c1, c2 = st.columns([3, 1])
-                    c1.markdown(f"{c.icon} **{c.name}**")
-                    c1.caption(c.description)
-                    c2.metric("Progress", f"{done}/{total}")
-                    st.progress(done / max(total, 1))
+                    st.markdown(f"{icon} ~~{name}~~ ✅  \n_{desc}_  \n<small>Completed {ts}</small>", unsafe_allow_html=True)
 
-            if completed_chall:
-                st.markdown("**Completed 🎉:**")
-                for c, completed_at in completed_chall:
-                    with st.container(border=True):
-                        ts = completed_at.strftime("%b %d, %Y") if completed_at and hasattr(completed_at, 'strftime') else ""
-                        st.markdown(f"{c.icon} ~~{c.name}~~ ✅  \n_{c.description}_  \n<small>Completed {ts}</small>", unsafe_allow_html=True)
 
-    # ─────────────────────────────────────────────
-    # GEAR TEMPLATES TAB
-    # ─────────────────────────────────────────────
-    with gear_tab:
-        st.header("🎒 Gear Templates")
-        st.caption("Save reusable packing lists. Apply them to any trip.")
+def render_gear(current_uid):
+    st.header("🎒 Gear Templates")
+    st.caption("Save reusable packing lists. Apply them to any trip.")
 
-        gt_list_tab, gt_create_tab, gt_community_tab = st.tabs(["My Templates", "Create New", "Community Templates"])
+    gt_list_tab, gt_create_tab, gt_community_tab = st.tabs(["My Templates", "Create New", "Community Templates"])
 
-        with gt_list_tab:
-            with engine.connect() as conn2:
-                my_templates = conn2.execute(text("""
-                    SELECT gt.id, gt.template_name, gt.is_public,
-                           COUNT(gti.id) AS item_count
-                    FROM gear_templates gt
-                    LEFT JOIN gear_template_items gti ON gt.id=gti.template_id
-                    WHERE gt.user_id=:uid
-                    GROUP BY gt.id, gt.template_name, gt.is_public
-                    ORDER BY gt.template_name
-                """), {"uid": current_uid}).fetchall()
+    with gt_list_tab:
+        templates, items_by_template = get_gear_templates(current_uid)
+        if not templates:
+            st.info("No gear templates yet. Create one in the 'Create New' tab, or let AI generate one when you save a trip!")
+        else:
+            for gt in templates:
+                with st.expander(f"{'🌐' if gt.is_public else '🔒'} {gt.template_name}  ·  {gt.item_count} items"):
+                    items = items_by_template.get(gt.id, [])
+                    cats = {}
+                    for item in items:
+                        cats.setdefault(item.category or "General", []).append(item)
 
-            if not my_templates:
-                st.info("No gear templates yet. Create one in the 'Create New' tab, or let AI generate one when you save a trip!")
-            else:
-                for gt in my_templates:
-                    with st.expander(f"{'🌐' if gt.is_public else '🔒'} {gt.template_name}  ·  {gt.item_count} items"):
-                        with engine.connect() as conn2:
-                            items = conn2.execute(text("""
-                                SELECT id, category, item_name FROM gear_template_items
-                                WHERE template_id=:tid ORDER BY category, item_name
-                            """), {"tid": gt.id}).fetchall()
+                    ic1, ic2 = st.columns(2)
+                    for ci, (cat, citems) in enumerate(sorted(cats.items())):
+                        with (ic1 if ci % 2 == 0 else ic2):
+                            st.markdown(f"**{cat}**")
+                            for it in citems:
+                                del_col, name_col = st.columns([1, 8])
+                                name_col.caption(f"• {it.item_name}")
+                                if del_col.button("✕", key=f"del_gti_{it.id}", help="Remove item"):
+                                    with engine.begin() as conn2:
+                                        conn2.execute(text("DELETE FROM gear_template_items WHERE id=:id"), {"id": it.id})
+                                    get_gear_templates.clear()
+                                    st.rerun()
 
-                        cats = {}
-                        for item in items:
-                            cats.setdefault(item.category or "General", []).append(item)
-
-                        ic1, ic2 = st.columns(2)
-                        for ci, (cat, citems) in enumerate(sorted(cats.items())):
-                            with (ic1 if ci % 2 == 0 else ic2):
-                                st.markdown(f"**{cat}**")
-                                for it in citems:
-                                    del_col, name_col = st.columns([1, 8])
-                                    name_col.caption(f"• {it.item_name}")
-                                    if del_col.button("✕", key=f"del_gti_{it.id}", help="Remove item"):
-                                        with engine.begin() as conn2:
-                                            conn2.execute(text("DELETE FROM gear_template_items WHERE id=:id"), {"id": it.id})
-                                        st.rerun()
-
-                        st.divider()
-                        ai1, ai2, ai3 = st.columns([3, 2, 1])
-                        new_item_name = ai1.text_input("Item", key=f"new_gti_name_{gt.id}")
-                        new_item_cat = ai2.selectbox("Category", ["Clothing", "Footwear", "Navigation", "Safety",
-                            "Camping/Shelter", "Food & Water", "Photography", "Personal Care", "Documents", "Other"],
-                            key=f"new_gti_cat_{gt.id}")
-                        if ai3.button("Add", key=f"add_gti_{gt.id}") and new_item_name:
-                            with engine.begin() as conn2:
-                                conn2.execute(text("INSERT INTO gear_template_items (template_id, category, item_name) VALUES (:tid,:cat,:item)"),
-                                              {"tid": gt.id, "cat": new_item_cat, "item": new_item_name})
-                            st.rerun()
-
-                        st.divider()
-                        pub_col, del_col2 = st.columns(2)
-                        if pub_col.button("🌐 Make Public" if not gt.is_public else "🔒 Make Private", key=f"toggle_pub_gt_{gt.id}"):
-                            with engine.begin() as conn2:
-                                conn2.execute(text("UPDATE gear_templates SET is_public=:p WHERE id=:id"),
-                                              {"p": not gt.is_public, "id": gt.id})
-                            st.rerun()
-                        if del_col2.button("🗑️ Delete Template", key=f"del_gt_{gt.id}"):
-                            with engine.begin() as conn2:
-                                conn2.execute(text("DELETE FROM gear_templates WHERE id=:id"), {"id": gt.id})
-                            st.rerun()
-
-        with gt_create_tab:
-            st.markdown("**Create a new gear template**")
-            new_gt_name = st.text_input("Template name (e.g. 'My Car Camping Kit')", key="new_gt_name")
-            new_gt_public = st.checkbox("Make public so others can use it", key="new_gt_public")
-
-            ai_gen_col, manual_col = st.columns(2)
-            with ai_gen_col:
-                st.markdown("**✨ AI Generate**")
-                ai_trip_type = st.text_input("Describe the trip type (e.g. '3-day desert backpacking')", key="gt_ai_desc")
-                if st.button("Generate with AI", use_container_width=True) and new_gt_name and ai_trip_type:
-                    with st.spinner("Building your kit..."):
-                        items = generate_packing_list([ai_trip_type], [], 3)
-                    if items:
+                    st.divider()
+                    ai1, ai2, ai3 = st.columns([3, 2, 1])
+                    new_item_name = ai1.text_input("Item", key=f"new_gti_name_{gt.id}")
+                    new_item_cat = ai2.selectbox("Category", ["Clothing", "Footwear", "Navigation", "Safety",
+                        "Camping/Shelter", "Food & Water", "Photography", "Personal Care", "Documents", "Other"],
+                        key=f"new_gti_cat_{gt.id}")
+                    if ai3.button("Add", key=f"add_gti_{gt.id}") and new_item_name:
                         with engine.begin() as conn2:
-                            gt_id = conn2.execute(text("""
-                                INSERT INTO gear_templates (user_id, template_name, is_public)
-                                VALUES (:uid,:name,:pub) RETURNING id
-                            """), {"uid": current_uid, "name": new_gt_name, "pub": new_gt_public}).scalar()
-                            for item in items:
-                                conn2.execute(text("INSERT INTO gear_template_items (template_id, category, item_name) VALUES (:tid,:cat,:item)"),
-                                              {"tid": gt_id, "cat": item.get("category","General"), "item": item.get("item","")})
-                        st.success(f"Template '{new_gt_name}' created with {len(items)} items!")
+                            conn2.execute(text("INSERT INTO gear_template_items (template_id, category, item_name) VALUES (:tid,:cat,:item)"),
+                                          {"tid": gt.id, "cat": new_item_cat, "item": new_item_name})
+                        get_gear_templates.clear()
                         st.rerun()
 
-            with manual_col:
-                st.markdown("**📝 Create Empty**")
-                st.caption("Create a blank template and add items manually.")
-                if st.button("Create Empty Template", use_container_width=True) and new_gt_name:
+                    st.divider()
+                    pub_col, del_col2 = st.columns(2)
+                    if pub_col.button("🌐 Make Public" if not gt.is_public else "🔒 Make Private", key=f"toggle_pub_gt_{gt.id}"):
+                        with engine.begin() as conn2:
+                            conn2.execute(text("UPDATE gear_templates SET is_public=:p WHERE id=:id"), {"p": not gt.is_public, "id": gt.id})
+                        get_gear_templates.clear(); get_community_gear_templates.clear()
+                        st.rerun()
+                    if del_col2.button("🗑️ Delete Template", key=f"del_gt_{gt.id}"):
+                        with engine.begin() as conn2:
+                            conn2.execute(text("DELETE FROM gear_templates WHERE id=:id"), {"id": gt.id})
+                        get_gear_templates.clear()
+                        st.rerun()
+
+    with gt_create_tab:
+        st.markdown("**Create a new gear template**")
+        new_gt_name = st.text_input("Template name (e.g. 'My Car Camping Kit')", key="new_gt_name")
+        new_gt_public = st.checkbox("Make public so others can use it", key="new_gt_public")
+
+        ai_gen_col, manual_col = st.columns(2)
+        with ai_gen_col:
+            st.markdown("**✨ AI Generate**")
+            ai_trip_type = st.text_input("Describe the trip type (e.g. '3-day desert backpacking')", key="gt_ai_desc")
+            if st.button("Generate with AI", use_container_width=True) and new_gt_name and ai_trip_type:
+                with st.spinner("Building your kit..."):
+                    items = generate_packing_list([ai_trip_type], [], 3)
+                if items:
                     with engine.begin() as conn2:
-                        conn2.execute(text("INSERT INTO gear_templates (user_id, template_name, is_public) VALUES (:uid,:name,:pub)"),
-                                      {"uid": current_uid, "name": new_gt_name, "pub": new_gt_public})
-                    st.success(f"Template '{new_gt_name}' created!")
+                        gt_id = conn2.execute(text("INSERT INTO gear_templates (user_id, template_name, is_public) VALUES (:uid,:name,:pub) RETURNING id"),
+                                              {"uid": current_uid, "name": new_gt_name, "pub": new_gt_public}).scalar()
+                        for item in items:
+                            conn2.execute(text("INSERT INTO gear_template_items (template_id, category, item_name) VALUES (:tid,:cat,:item)"),
+                                          {"tid": gt_id, "cat": item.get("category", "General"), "item": item.get("item", "")})
+                    get_gear_templates.clear()
+                    st.success(f"Template '{new_gt_name}' created with {len(items)} items!")
                     st.rerun()
 
-        with gt_community_tab:
-            st.markdown("**Community Gear Templates**")
-            with engine.connect() as conn2:
-                pub_templates = conn2.execute(text("""
-                    SELECT gt.id, gt.template_name, u.firstname, u.lastname,
-                           COUNT(gti.id) AS item_count
-                    FROM gear_templates gt
-                    JOIN users u ON gt.user_id=u.id
-                    LEFT JOIN gear_template_items gti ON gt.id=gti.template_id
-                    WHERE gt.is_public=TRUE AND gt.user_id!=:uid
-                    GROUP BY gt.id, gt.template_name, u.firstname, u.lastname
-                    ORDER BY item_count DESC LIMIT 20
-                """), {"uid": current_uid}).fetchall()
+        with manual_col:
+            st.markdown("**📝 Create Empty**")
+            st.caption("Create a blank template and add items manually.")
+            if st.button("Create Empty Template", use_container_width=True) and new_gt_name:
+                with engine.begin() as conn2:
+                    conn2.execute(text("INSERT INTO gear_templates (user_id, template_name, is_public) VALUES (:uid,:name,:pub)"),
+                                  {"uid": current_uid, "name": new_gt_name, "pub": new_gt_public})
+                get_gear_templates.clear()
+                st.success(f"Template '{new_gt_name}' created!")
+                st.rerun()
 
-            if not pub_templates:
-                st.info("No community templates yet.")
-            else:
-                for pt in pub_templates:
-                    with st.expander(f"**{pt.template_name}** by {pt.firstname} {pt.lastname}  ·  {pt.item_count} items"):
-                        with engine.connect() as conn2:
-                            items = conn2.execute(text("""
-                                SELECT category, item_name FROM gear_template_items
-                                WHERE template_id=:tid ORDER BY category, item_name
-                            """), {"tid": pt.id}).fetchall()
-                        cats = {}
-                        for item in items:
-                            cats.setdefault(item.category or "General", []).append(item.item_name)
-                        cc1, cc2 = st.columns(2)
-                        for ci, (cat, names) in enumerate(sorted(cats.items())):
-                            with (cc1 if ci % 2 == 0 else cc2):
-                                st.markdown(f"**{cat}**")
-                                for n in names:
-                                    st.caption(f"• {n}")
-                        if st.button("📋 Copy to My Templates", key=f"copy_gt_{pt.id}"):
-                            with engine.begin() as conn2:
-                                new_id = conn2.execute(text("""
-                                    INSERT INTO gear_templates (user_id, template_name, is_public)
-                                    VALUES (:uid, :name, FALSE) RETURNING id
-                                """), {"uid": current_uid, "name": f"{pt.template_name} (copy)"}).scalar()
-                                conn2.execute(text("""
-                                    INSERT INTO gear_template_items (template_id, category, item_name)
-                                    SELECT :new_id, category, item_name FROM gear_template_items WHERE template_id=:old_id
-                                """), {"new_id": new_id, "old_id": pt.id})
-                            st.success("Copied to your templates!")
-                            st.rerun()
+    with gt_community_tab:
+        st.markdown("**Community Gear Templates**")
+        pub_templates, pub_items_by_template = get_community_gear_templates(current_uid)
+        if not pub_templates:
+            st.info("No community templates yet.")
+        else:
+            for pt in pub_templates:
+                with st.expander(f"**{pt.template_name}** by {pt.firstname} {pt.lastname}  ·  {pt.item_count} items"):
+                    items = pub_items_by_template.get(pt.id, [])
+                    cats = {}
+                    for item in items:
+                        cats.setdefault(item.category or "General", []).append(item.item_name)
+                    cc1, cc2 = st.columns(2)
+                    for ci, (cat, names) in enumerate(sorted(cats.items())):
+                        with (cc1 if ci % 2 == 0 else cc2):
+                            st.markdown(f"**{cat}**")
+                            for n in names:
+                                st.caption(f"• {n}")
+                    if st.button("📋 Copy to My Templates", key=f"copy_gt_{pt.id}"):
+                        with engine.begin() as conn2:
+                            new_id = conn2.execute(text("INSERT INTO gear_templates (user_id, template_name, is_public) VALUES (:uid, :name, FALSE) RETURNING id"),
+                                                    {"uid": current_uid, "name": f"{pt.template_name} (copy)"}).scalar()
+                            conn2.execute(text("""
+                                INSERT INTO gear_template_items (template_id, category, item_name)
+                                SELECT :new_id, category, item_name FROM gear_template_items WHERE template_id=:old_id
+                            """), {"new_id": new_id, "old_id": pt.id})
+                        get_gear_templates.clear()
+                        st.success("Copied to your templates!")
+                        st.rerun()
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═════════════════════════════════════════════════════════════════════════
+
+if not st.session_state.logged_in:
+    render_auth()
+else:
+    current_uid = st.session_state.user_info['id']
+
+    if not st.session_state.badges_checked_session:
+        new_badges = compute_and_award_badges(current_uid)
+        st.session_state.badges_checked_session = True
+        for b in new_badges:
+            st.toast(f"🏅 Badge unlocked: {b}!", icon="🎉")
+
+    render_sidebar(current_uid)
+
+    # Single active section per rerun — this is the main perf fix. Only the
+    # chosen section's render function (and therefore its queries) runs.
+    st.session_state.active_section = st.radio(
+        "Navigate", SECTIONS, horizontal=True, label_visibility="collapsed", key="nav_radio"
+    )
+    st.divider()
+
+    section = st.session_state.active_section
+    if section == "🗺️ Plan Trip":
+        render_plan_trip(current_uid)
+    elif section == "🔭 Park Explorer":
+        render_explorer(current_uid)
+    elif section == "👥 Friends":
+        render_friends(current_uid)
+    elif section == "🎒 My Trips":
+        render_my_trips(current_uid)
+    elif section == "📊 My Stats":
+        render_stats(current_uid)
+    elif section == "🗺 Passport":
+        render_passport(current_uid)
+    elif section == "🌍 Discover":
+        render_discover(current_uid)
+    elif section == "🎒 Gear":
+        render_gear(current_uid)
+    elif section == "🔔 Notifications":
+        render_notifications(current_uid)
