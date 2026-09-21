@@ -19,18 +19,20 @@ National Park Planner pulls live data directly from the National Park Service (N
 
 ## Tech stack
 
-- **Frontend:** React
-- **Backend:** FastAPI (Python)
-- **Database:** PostgreSQL
+- **App:** Streamlit (Python)
+- **Database:** PostgreSQL (accessed via SQLAlchemy)
 - **External data:** National Park Service (NPS) API
-- **AI:** LLM-generated itinerary planning
+- **AI:** Google Gemini API for itinerary generation
+- **Automation:** GitHub Actions — hourly scheduled job (`etl_pipeline.py`) keeps park data and alerts in sync
+- **Other:** bcrypt (auth), fpdf2 (PDF export of itineraries)
 
 ## Architecture notes
 
-This project originally started as a Streamlit prototype and was rebuilt into a production-style architecture: a React frontend talking to a FastAPI backend, backed by PostgreSQL instead of flat/session state. The rebuild was driven by the need for real user accounts, persistent relational data (friends, trips, gear lists), and a UI flexible enough to support a social feature set — none of which Streamlit was designed to handle well at that scale.
+This project started as a CLI prototype (`main.py`) and was rebuilt as a Streamlit app (`app.py`) backed by PostgreSQL instead of flat/session state, so it could support real user accounts and persistent relational data (friends, trips, gear lists). Data freshness is handled outside the app itself: a GitHub Actions workflow runs `etl_pipeline.py` on an hourly cron schedule to pull the latest NPS data and alerts into the database, so the app is always reading current data rather than making live API calls on every page load.
 
 ## What's next
 
+- [ ] Rebuild the frontend in React with a FastAPI backend
 - [ ] Add trip cost estimation
 - [ ] Expand the passport map with visit dates and photos
 - [ ] Add park-specific gear recommendations based on season/terrain
