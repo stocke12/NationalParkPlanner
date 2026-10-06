@@ -61,3 +61,4 @@ urllib3==2.6.3
 websockets==15.0.1
 bcrypt
 plotly
+psycopg[binary]>=3.1
